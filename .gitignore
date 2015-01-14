@@ -1,0 +1,20 @@
+dist
+cabal-dev
+vendor/
+.cabal-sandbox
+cabal.sandbox.config
+*.o
+*.hi
+*.chi
+*.chs.h
+hi/
+prof/
+Session.vim
+log.txt
+report.html
+.hsenv
+.shelly
+spec.*
+tags
+tags (Case Conflict)
+TAGS
