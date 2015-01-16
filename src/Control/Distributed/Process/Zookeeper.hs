@@ -7,10 +7,13 @@ module Control.Distributed.Process.Zookeeper
    , registerZK
    ) where
 
-import Database.Zookeeper.Lifted hiding (State)
+import Database.Zookeeper (Zookeeper, AclList(..), CreateFlag(..), Event(..), ZKError(..))
+import qualified Database.Zookeeper as ZK
 
 import Control.Monad (void, join, forM_)
+import Control.Monad.IO.Class (MonadIO)
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar, putMVar)
+import Control.Concurrent (forkIO)
 import Control.Exception (throwIO)
 import Data.Binary (Binary, encode)
 import Data.Typeable (Typeable)
@@ -24,7 +27,7 @@ import Data.Maybe (fromMaybe)
 
 import Control.Distributed.Process hiding (proxy)
 import Control.Distributed.Process.Serializable
-import Control.Distributed.Process.MonadBaseControl ()
+import Control.Distributed.Process.Node (runProcess, LocalNode)
 
 
 
@@ -47,22 +50,28 @@ instance Binary Command
 
 -- | Starts a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper.
-zkController :: String -- ^ The Zookeeper endpoint, as in 'Base.withZookeeper'
+zkController :: LocalNode
+             -> String -- ^ The Zookeeper endpoint, as in 'Base.withZookeeper'
              -> Process ()
-zkController services =
+zkController localnode services =
  do proxy <- spawnProxy
-    zkpid <- spawnLocal $
-     do pid <- getSelfPid
-        withZookeeper services 1000 (Just $ watcher proxy pid) Nothing $ \rzh ->
-            let loop st@State{..} =
-                    let recvCmd = match $ \command -> case command of
-                                            Exit -> terminate --TODO: this could be better
-                                            _ -> handle st command
-                        recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
-                                            reap st dead
-                    in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
-            in loop (State rzh [] mempty)
-    register controller zkpid
+    liftIO $ void $ forkIO $
+        ZK.withZookeeper services 1000 (Just $ watcher proxy) Nothing $ \rzh ->
+            runProcess localnode $
+             do pid <- getSelfPid
+                register controller pid
+                Right _ <- create rzh (controllersNode </> pretty pid)
+                                      (pidB pid) OpenAclUnsafe [Ephemeral]
+                Right children <- liftIO $ ZK.getChildren rzh controllersNode Nothing
+
+                let loop st@State{..} =
+                        let recvCmd = match $ \command -> case command of
+                                                Exit -> terminate --TODO: this could be better
+                                                _ -> handle st command
+                            recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
+                                                reap st dead
+                        in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
+                loop (State rzh children mempty)
   where
     reap st@State{..} pid =
         let names = fromMaybe [] (Map.lookup pid monPids)
@@ -95,17 +104,13 @@ zkController services =
 
     handle st Exit = return st
 
-    watcher proxy pid rzh SessionEvent ConnectedState _ =
+    watcher _ rzh SessionEvent ZK.ConnectedState _ =
       void $ do
                 create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
                 create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
                 create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
-                Right _ <- create rzh (controllersNode </> pretty pid)
-                                      (pidB pid) OpenAclUnsafe [Ephemeral]
-                Right children <- getChildren rzh controllersNode Nothing
-                proxy $ castZK (NodeList children)
 
-    watcher _ _ _ _ _ _ = return ()
+    watcher _ _ _ _ _ = return ()
 
     servicesNode = rootNode </> "services"
     controllersNode = rootNode </> "controllers"
@@ -124,7 +129,7 @@ registerZK name rpid =
     callZK $ Register name rpid
 
 controller :: String
-controller = "zookeeper"
+controller = "zookeeper:controller"
 
 callZK :: Serializable a => (SendPort a -> Command) -> Process a
 callZK command =
@@ -136,11 +141,6 @@ callZK command =
        unlink pid
        return result
 
-castZK :: Command -> Process ()
-castZK command =
-    do Just pid <- whereis controller
-       send pid command
-
 spawnProxy :: Process (Process () -> IO ())
 spawnProxy =
  do mv <- liftIO newEmptyMVar
@@ -148,3 +148,10 @@ spawnProxy =
         let loop = join (liftIO $ takeMVar mv) >> loop
         in loop
     return (putMVar mv)
+
+create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
+       -> AclList -> [CreateFlag] -> m (Either ZKError String)
+create z n d a = liftIO . ZK.create z n d a
+
+delete :: MonadIO m => Zookeeper -> String -> Maybe ZK.Version -> m (Either ZKError ())
+delete z n = liftIO . ZK.delete z n
