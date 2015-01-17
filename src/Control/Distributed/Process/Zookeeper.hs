@@ -1,45 +1,57 @@
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE RecordWildCards    #-}
 
 module Control.Distributed.Process.Zookeeper
    ( zkController
    , registerZK
+   , getPeers
    ) where
 
-import Database.Zookeeper (Zookeeper, AclList(..), CreateFlag(..), Event(..), ZKError(..))
-import qualified Database.Zookeeper as ZK
+import           Database.Zookeeper                       (AclList (..),
+                                                           CreateFlag (..),
+                                                           Event (..),
+                                                           ZKError (..),
+                                                           Zookeeper)
+import qualified Database.Zookeeper                       as ZK
 
-import Control.Monad (void, join, forM_)
-import Control.Monad.IO.Class (MonadIO)
-import Control.Concurrent.MVar (newEmptyMVar, takeMVar, putMVar)
-import Control.Concurrent (forkIO)
-import Control.Exception (throwIO)
-import Data.Binary (Binary, encode)
-import Data.Typeable (Typeable)
-import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString as BS
-import GHC.Generics (Generic)
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
-import Data.Monoid (mempty)
-import Data.Maybe (fromMaybe)
+import           Control.Concurrent                       (forkIO)
+import           Control.Concurrent.MVar                  (newEmptyMVar,
+                                                           putMVar, takeMVar)
+import           Control.Exception                        (throwIO)
+import           Control.Monad                            (forM, forM_, join,
+                                                           void)
+import           Control.Monad.Except                     (ExceptT (..), lift)
+import           Control.Monad.IO.Class                   (MonadIO)
+import           Control.Monad.Trans.Except               (runExceptT, throwE)
+import           Data.Binary                              (Binary, decode,
+                                                           encode)
+import qualified Data.ByteString                          as BS
+import qualified Data.ByteString.Lazy                     as BL
+import           Data.Map.Strict                          (Map)
+import qualified Data.Map.Strict                          as Map
+import           Data.Maybe                               (fromMaybe)
+import           Data.Monoid                              (mempty)
+import           Data.Typeable                            (Typeable)
+import           GHC.Generics                             (Generic)
 
-import Control.Distributed.Process hiding (proxy)
-import Control.Distributed.Process.Serializable
-import Control.Distributed.Process.Node (runProcess, LocalNode)
+import           Control.Distributed.Process              hiding (proxy)
+import           Control.Distributed.Process.Node         (LocalNode,
+                                                           runProcess)
+import           Control.Distributed.Process.Serializable
 
 
 
 data Command = Register String ProcessId (SendPort (Either String ()))
              | NodeList [String]
+             | GetControllerNodeIds (SendPort (Either String [NodeId]))
              | Exit
     deriving (Show, Typeable, Generic)
 
 data State = State
     {
-      conn :: Zookeeper
-    , nodes :: [String]
+      conn    :: Zookeeper
+    , nodes   :: [String]
     -- service nodes to remove each pid from when it exits
     , monPids :: Map ProcessId [String]
     }
@@ -62,7 +74,7 @@ zkController localnode services =
                 register controller pid
                 Right _ <- create rzh (controllersNode </> pretty pid)
                                       (pidB pid) OpenAclUnsafe [Ephemeral]
-                Right children <- liftIO $ ZK.getChildren rzh controllersNode Nothing
+                Right nodes' <- liftIO $ ZK.getChildren rzh controllersNode Nothing
 
                 let loop st@State{..} =
                         let recvCmd = match $ \command -> case command of
@@ -71,7 +83,7 @@ zkController localnode services =
                             recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
                                                 reap st dead
                         in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
-                loop (State rzh children mempty)
+                loop (State rzh nodes' mempty)
   where
     reap st@State{..} pid =
         let names = fromMaybe [] (Map.lookup pid monPids)
@@ -100,6 +112,30 @@ zkController localnode services =
         void $ monitor rpid
         return st{monPids = Map.insertWith (++) rpid [name] monPids}
 
+    handle st@State{..} (GetControllerNodeIds reply) =
+     do enodes' <- liftIO $ ZK.getChildren conn controllersNode Nothing
+        eall <- runExceptT $
+         do nodes' <- hoistEither (zkeither enodes')
+            forM nodes' $ \node' ->
+             do eresult <- liftIO $ ZK.get conn node' Nothing
+                case eresult of
+                   Left reason ->
+                     do let msg = "Error fetching data for controller: " ++ node'
+                                  ++ " : " ++ show reason
+                        lift $ say msg
+                        throwE msg
+                   Right (Nothing, _) ->
+                     do let msg = "Error fetching data for controller: " ++ node'
+                                  ++ " : data was empty."
+                        lift $ say msg
+                        throwE msg
+                   Right (Just bs, _) ->
+                       let pid = decode (BL.fromStrict bs) in return (processNodeId pid)
+        case eall of
+            Left reason -> sendChan reply (Left reason)
+            Right results -> sendChan reply (Right results)
+        return st
+
     handle st (NodeList n) = return st{nodes = n}
 
     handle st Exit = return st
@@ -117,7 +153,11 @@ zkController localnode services =
     rootNode = "/distributed-process"
     l </> r = l ++ "/" ++ r
     pretty pid = drop 6 (show pid)
-    pidB pid = Just . BS.concat . BL.toChunks $ encode pid
+    pidB pid = Just . BL.toStrict $ encode pid
+
+    zkeither (Left zkerr) = Left $ show zkerr
+    zkeither (Right a) = Right a
+    hoistEither = ExceptT . return
 
     assertNode _ (Right _) = return ()
     assertNode _ (Left NodeExistsError) = return ()
@@ -127,6 +167,10 @@ zkController localnode services =
 registerZK :: String -> ProcessId -> Process (Either String ())
 registerZK name rpid =
     callZK $ Register name rpid
+
+-- | Get a list of currently available peer nodes.
+getPeers :: Process [NodeId]
+getPeers = either (const []) id `fmap` callZK GetControllerNodeIds
 
 controller :: String
 controller = "zookeeper:controller"
