@@ -15,9 +15,8 @@ import           Database.Zookeeper                       (AclList (..),
                                                            Zookeeper)
 import qualified Database.Zookeeper                       as ZK
 
-import           Control.Concurrent                       (forkIO)
-import           Control.Concurrent.MVar                  (newEmptyMVar,
-                                                           putMVar, takeMVar)
+import Control.Concurrent.MVar
+       (newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
 import           Control.Exception                        (throwIO)
 import           Control.Monad                            (forM, forM_, join,
                                                            void)
@@ -36,8 +35,6 @@ import           Data.Typeable                            (Typeable)
 import           GHC.Generics                             (Generic)
 
 import           Control.Distributed.Process              hiding (proxy)
-import           Control.Distributed.Process.Node         (LocalNode,
-                                                           runProcess)
 import           Control.Distributed.Process.Serializable
 
 data Command = Register String ProcessId (SendPort (Either String ()))
@@ -59,22 +56,22 @@ instance Binary Command
 
 -- | Starts a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper.
-zkController :: LocalNode
-             -> String -- ^ The Zookeeper endpoint, as in 'Base.withZookeeper'
+zkController
+             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+             :: String
              -> Process ()
-zkController localnode services =
- do proxy <- spawnProxy
-    liftIO $ void $ forkIO $
-        ZK.withZookeeper services 1000 (Just $ watcher proxy) Nothing $ \rzh ->
-            runProcess localnode (server rzh)
+zkController keepers =
+ do run <- spawnProxy
+    liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
+        run (server rzh)
   where
-    watcher _ rzh SessionEvent ZK.ConnectedState _ =
+    inits rzh SessionEvent ZK.ConnectedState _ =
       void $ do
                 create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
                 create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
                 create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
 
-    watcher _ _ _ _ _ = return ()
+    inits _ _ _ _ = return ()
 
 server :: Zookeeper -> Process ()
 server rzh =
@@ -91,7 +88,7 @@ server rzh =
                 recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
                                     reap st dead
             in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
-    loop (State nodes' mempty)
+    void $ loop (State nodes' mempty)
   where
     reap st@State{..} pid =
         let names = fromMaybe [] (Map.lookup pid monPids)
@@ -201,13 +198,17 @@ callZK command =
        unlink pid
        return result
 
-spawnProxy :: Process (Process () -> IO ())
+-- | Create a process runner that communicates
+-- through an MVar - so you can call process actions from IO
+spawnProxy :: Process (Process a -> IO a)
 spawnProxy =
- do mv <- liftIO newEmptyMVar
+ do action <- liftIO newEmptyMVar
+    result <- liftIO newEmptyMVar
     void $ spawnLocal $
-        let loop = join (liftIO $ takeMVar mv) >> loop
-        in loop
-    return (putMVar mv)
+        let loop = join (liftIO $ takeMVar action)
+                   >>= liftIO . putMVar result
+                   >> loop in loop
+    return $ \f -> putMVar action f >> takeMVar result
 
 create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
        -> AclList -> [CreateFlag] -> m (Either ZKError String)
