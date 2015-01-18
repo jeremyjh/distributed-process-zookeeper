@@ -40,8 +40,6 @@ import           Control.Distributed.Process.Node         (LocalNode,
                                                            runProcess)
 import           Control.Distributed.Process.Serializable
 
-
-
 data Command = Register String ProcessId (SendPort (Either String ()))
              | NodeList [String]
              | GetControllerNodeIds (SendPort (Either String [NodeId]))
@@ -50,8 +48,7 @@ data Command = Register String ProcessId (SendPort (Either String ()))
 
 data State = State
     {
-      conn    :: Zookeeper
-    , nodes   :: [String]
+      nodes   :: [String]
     -- service nodes to remove each pid from when it exits
     , monPids :: Map ProcessId [String]
     }
@@ -69,27 +66,38 @@ zkController localnode services =
  do proxy <- spawnProxy
     liftIO $ void $ forkIO $
         ZK.withZookeeper services 1000 (Just $ watcher proxy) Nothing $ \rzh ->
-            runProcess localnode $
-             do pid <- getSelfPid
-                register controller pid
-                Right _ <- create rzh (controllersNode </> pretty pid)
-                                      (pidB pid) OpenAclUnsafe [Ephemeral]
-                Right nodes' <- liftIO $ ZK.getChildren rzh controllersNode Nothing
+            runProcess localnode (server rzh)
+  where
+    watcher _ rzh SessionEvent ZK.ConnectedState _ =
+      void $ do
+                create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
+                create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
+                create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
 
-                let loop st@State{..} =
-                        let recvCmd = match $ \command -> case command of
-                                                Exit -> terminate --TODO: this could be better
-                                                _ -> handle st command
-                            recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
-                                                reap st dead
-                        in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
-                loop (State rzh nodes' mempty)
+    watcher _ _ _ _ _ = return ()
+
+server :: Zookeeper -> Process ()
+server rzh =
+ do pid <- getSelfPid
+    register controller pid
+    Right _ <- create rzh (controllersNode </> pretty pid)
+                          (pidB pid) OpenAclUnsafe [Ephemeral]
+    Right nodes' <- liftIO $ ZK.getChildren rzh controllersNode Nothing
+
+    let loop st =
+            let recvCmd = match $ \command -> case command of
+                                    Exit -> terminate --TODO: this could be better
+                                    _ -> handle st command
+                recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
+                                    reap st dead
+            in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
+    loop (State nodes' mempty)
   where
     reap st@State{..} pid =
         let names = fromMaybe [] (Map.lookup pid monPids)
         in do forM_ names $ \name ->
                do let node = servicesNode </> name </> pretty pid
-                  result <- delete conn node Nothing
+                  result <- delete rzh node Nothing
                   case result of
                     Left reason -> say $ "Error: "
                                          ++ show reason
@@ -99,9 +107,9 @@ zkController localnode services =
               return st{monPids = Map.delete pid monPids}
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
-        create conn (servicesNode </> name)
+        create rzh (servicesNode </> name)
                     Nothing OpenAclUnsafe [] >>= assertNode name
-        result <- create conn node (pidB rpid)
+        result <- create rzh node (pidB rpid)
                          OpenAclUnsafe [Ephemeral]
         case result of
             Right _ ->
@@ -112,46 +120,40 @@ zkController localnode services =
         void $ monitor rpid
         return st{monPids = Map.insertWith (++) rpid [name] monPids}
 
-    handle st@State{..} (GetControllerNodeIds reply) =
-     do enodes' <- liftIO $ ZK.getChildren conn controllersNode Nothing
-        eall <- runExceptT $
-         do nodes' <- hoistEither (zkeither enodes')
-            forM nodes' $ \node' ->
-             do eresult <- liftIO $ ZK.get conn node' Nothing
-                case eresult of
-                   Left reason ->
-                     do let msg = "Error fetching data for controller: " ++ node'
-                                  ++ " : " ++ show reason
-                        lift $ say msg
-                        throwE msg
-                   Right (Nothing, _) ->
-                     do let msg = "Error fetching data for controller: " ++ node'
-                                  ++ " : data was empty."
-                        lift $ say msg
-                        throwE msg
-                   Right (Just bs, _) ->
-                       let pid = decode (BL.fromStrict bs) in return (processNodeId pid)
-        case eall of
+    handle st (GetControllerNodeIds reply) =
+     do res <- getChildData controllersNode
+        case res of
             Left reason -> sendChan reply (Left reason)
-            Right results -> sendChan reply (Right results)
+            Right results ->
+                let toNid bs = processNodeId (decode (BL.fromStrict bs))
+                    nids = map toNid results
+                in sendChan reply (Right nids)
         return st
+
 
     handle st (NodeList n) = return st{nodes = n}
 
     handle st Exit = return st
 
-    watcher _ rzh SessionEvent ZK.ConnectedState _ =
-      void $ do
-                create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
-                create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
-                create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
+    getChildData node =
+     do enodes' <- liftIO $ ZK.getChildren rzh node Nothing
+        runExceptT $
+         do children <- hoistEither (zkeither enodes')
+            forM children $ \child ->
+             do eresult <- liftIO $ ZK.get rzh (node </> child) Nothing
+                case eresult of
+                   Left reason ->
+                     do let msg = "Error fetching data for " ++ child
+                                  ++ " : " ++ show reason
+                        lift $ say msg
+                        throwE msg
+                   Right (Nothing, _) ->
+                     do let msg = "Error fetching data for " ++ child
+                                  ++ " : data was empty."
+                        lift $ say msg
+                        throwE msg
+                   Right (Just bs, _) -> return bs
 
-    watcher _ _ _ _ _ = return ()
-
-    servicesNode = rootNode </> "services"
-    controllersNode = rootNode </> "controllers"
-    rootNode = "/distributed-process"
-    l </> r = l ++ "/" ++ r
     pretty pid = drop 6 (show pid)
     pidB pid = Just . BL.toStrict $ encode pid
 
@@ -159,10 +161,24 @@ zkController localnode services =
     zkeither (Right a) = Right a
     hoistEither = ExceptT . return
 
-    assertNode _ (Right _) = return ()
-    assertNode _ (Left NodeExistsError) = return ()
-    assertNode name (Left _) = liftIO $
-        throwIO (userError $ "Fatal: could not create node: " ++ name)
+(</>) :: String -> String -> String
+l </> r = l ++ "/" ++ r
+
+servicesNode :: String
+servicesNode = rootNode </> "services"
+
+controllersNode :: String
+controllersNode = rootNode </> "controllers"
+
+rootNode :: String
+rootNode = "/distributed-process"
+
+assertNode :: MonadIO m => String -> Either ZKError t -> m ()
+assertNode _ (Right _) = return ()
+assertNode _ (Left NodeExistsError) = return ()
+assertNode name (Left _) = liftIO $
+    throwIO (userError $ "Fatal: could not create node: " ++ name)
+
 
 registerZK :: String -> ProcessId -> Process (Either String ())
 registerZK name rpid =
