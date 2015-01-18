@@ -12,7 +12,8 @@ import           Database.Zookeeper                       (AclList (..),
                                                            CreateFlag (..),
                                                            Event (..),
                                                            ZKError (..),
-                                                           Zookeeper)
+                                                           Zookeeper,
+                                                           Watcher)
 import qualified Database.Zookeeper                       as ZK
 
 import Control.Concurrent.MVar
@@ -20,7 +21,7 @@ import Control.Concurrent.MVar
 import           Control.Exception                        (throwIO)
 import           Control.Monad                            (forM, forM_, join,
                                                            void)
-import           Control.Monad.Except                     (ExceptT (..), lift)
+import           Control.Monad.Except                     (ExceptT (..))
 import           Control.Monad.IO.Class                   (MonadIO)
 import           Control.Monad.Trans.Except               (runExceptT, throwE)
 import           Data.Binary                              (Binary, decode,
@@ -38,19 +39,28 @@ import           Control.Distributed.Process              hiding (proxy)
 import           Control.Distributed.Process.Serializable
 
 data Command = Register String ProcessId (SendPort (Either String ()))
-             | NodeList [String]
+             | WatchSet String [ProcessId]
              | GetControllerNodeIds (SendPort (Either String [NodeId]))
              | Exit
     deriving (Show, Typeable, Generic)
 
 data State = State
     {
-      nodes   :: [String]
+      watching :: Map String [ProcessId]
     -- service nodes to remove each pid from when it exits
     , monPids :: Map ProcessId [String]
     }
+
 instance Show State where
-    show State{..} = show ("nodes", nodes, "monPids", monPids)
+    show State{..} = show ("nodes", watching, "monPids", monPids)
+
+data Config = Config
+    { watchPeers :: Bool
+    , watchServices :: [String]
+    }
+
+defaultConfig :: Config
+defaultConfig = Config True []
 
 instance Binary Command
 
@@ -63,33 +73,60 @@ zkController
 zkController keepers =
  do run <- spawnProxy
     liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
-        run (server rzh)
+        run (server rzh defaultConfig)
   where
     inits rzh SessionEvent ZK.ConnectedState _ =
-      void $ do
-                create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
-                create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
-                create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
+      void $
+       do create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
+          create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
+          create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
 
     inits _ _ _ _ = return ()
 
-server :: Zookeeper -> Process ()
-server rzh =
+server :: Zookeeper -> Config -> Process ()
+server rzh Config{..} =
  do pid <- getSelfPid
     register controller pid
+    proxy <- spawnProxy
     Right _ <- create rzh (controllersNode </> pretty pid)
                           (pidB pid) OpenAclUnsafe [Ephemeral]
-    Right nodes' <- liftIO $ ZK.getChildren rzh controllersNode Nothing
-
+    watching' <- initWatch pid proxy
     let loop st =
-            let recvCmd = match $ \command -> case command of
-                                    Exit -> terminate --TODO: this could be better
-                                    _ -> handle st command
-                recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
-                                    reap st dead
-            in say (show st) >> receiveWait [recvCmd, recvMon] >>= loop
-    void $ loop (State nodes' mempty)
+          let recvCmd = match $ \command -> case command of
+                                  Exit -> return ()
+                                  _ -> handle st command >>= loop
+              recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
+                                  reap st dead >>= loop
+          in say (show st) >> receiveWait [recvCmd, recvMon]
+    void $ loop (State watching' mempty)
   where
+    initWatch pid proxy =
+     do let watchList = map (servicesNode </>) watchServices
+        let watchList' = if watchPeers
+                            then controllersNode : watchList
+                            else watchList
+        watchThese <- forM watchList' $ \node ->
+             do echildren <- getChildPids rzh node (Just $ watchNode pid proxy)
+                case echildren of
+                    Left reason ->
+                     do say $ "Couldn't fetch peer nodes: " ++ reason
+                        return (node, [])
+                    Right children ->
+                        return (node, children)
+        return $ Map.fromList watchThese
+
+    watchNode pid proxy zh ChildEvent ZK.ConnectedState (Just node) =
+     do epeers <- getChildPids zh node (Just $ watchNode pid proxy)
+        peers <- case epeers of
+                Left reason ->
+                 do proxy . say $
+                        "Failed to fetch PIDs for " ++ node ++ " - " ++ reason
+                    return []
+                Right peers -> return peers
+        proxy $ send pid (WatchSet node peers)
+
+    watchNode _ _ _ _ _ _ = return ()
+
     reap st@State{..} pid =
         let names = fromMaybe [] (Map.lookup pid monPids)
         in do forM_ names $ \name ->
@@ -100,8 +137,9 @@ server rzh =
                                          ++ show reason
                                          ++ " - failed to delete "
                                          ++ node
-                    _ -> say $ "Deleted " ++ node
+                    _ -> say $ "Reaped " ++ node
               return st{monPids = Map.delete pid monPids}
+
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
         create rzh (servicesNode </> name)
@@ -117,46 +155,48 @@ server rzh =
         void $ monitor rpid
         return st{monPids = Map.insertWith (++) rpid [name] monPids}
 
-    handle st (GetControllerNodeIds reply) =
-     do res <- getChildData controllersNode
-        case res of
-            Left reason -> sendChan reply (Left reason)
-            Right results ->
-                let toNid bs = processNodeId (decode (BL.fromStrict bs))
-                    nids = map toNid results
-                in sendChan reply (Right nids)
+    handle st@State{..} (GetControllerNodeIds reply) =
+     do epids <- case Map.lookup controllersNode watching of
+                        Just pids -> return (Right pids)
+                        Nothing -> getChildPids rzh controllersNode Nothing
+        sendChan reply (fmap (map processNodeId) epids)
         return st
 
-
-    handle st (NodeList n) = return st{nodes = n}
+    handle st@State{..} (WatchSet node pids) =
+        return st{watching = Map.insert node pids watching }
 
     handle st Exit = return st
-
-    getChildData node =
-     do enodes' <- liftIO $ ZK.getChildren rzh node Nothing
-        runExceptT $
-         do children <- hoistEither (zkeither enodes')
-            forM children $ \child ->
-             do eresult <- liftIO $ ZK.get rzh (node </> child) Nothing
-                case eresult of
-                   Left reason ->
-                     do let msg = "Error fetching data for " ++ child
-                                  ++ " : " ++ show reason
-                        lift $ say msg
-                        throwE msg
-                   Right (Nothing, _) ->
-                     do let msg = "Error fetching data for " ++ child
-                                  ++ " : data was empty."
-                        lift $ say msg
-                        throwE msg
-                   Right (Just bs, _) -> return bs
 
     pretty pid = drop 6 (show pid)
     pidB pid = Just . BL.toStrict $ encode pid
 
-    zkeither (Left zkerr) = Left $ show zkerr
-    zkeither (Right a) = Right a
-    hoistEither = ExceptT . return
+
+getChildPids :: MonadIO m
+             => Zookeeper -> String -> Maybe Watcher
+             -> m (Either String [ProcessId])
+getChildPids rzh node watcher = liftIO $
+ do enodes' <- ZK.getChildren rzh node watcher
+    runExceptT $
+     do children <- hoistEither (showEither enodes')
+        forM children $ \child ->
+         do eresult <- liftIO $ ZK.get rzh (node </> child) Nothing
+            case eresult of
+               Left reason ->
+                 do let msg = "Error fetching data for " ++ (node </> child)
+                              ++ " : " ++ show reason
+                    throwE msg
+               Right (Nothing, _) ->
+                 do let msg = "Error fetching data for " ++ (node </> child)
+                              ++ " : data was empty."
+                    throwE msg
+               Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
+
+hoistEither :: Monad m => Either e a -> ExceptT e m a
+hoistEither = ExceptT . return
+
+showEither :: Show a => Either a b -> Either String b
+showEither (Left zkerr) = Left $ show zkerr
+showEither (Right a) = Right a
 
 (</>) :: String -> String -> String
 l </> r = l ++ "/" ++ r
@@ -183,7 +223,13 @@ registerZK name rpid =
 
 -- | Get a list of currently available peer nodes.
 getPeers :: Process [NodeId]
-getPeers = either (const []) id `fmap` callZK GetControllerNodeIds
+getPeers =
+ do enids <- callZK GetControllerNodeIds
+    case enids of
+        Right nids -> return nids
+        Left reason ->
+         do say $ "getPeers failed: " ++ reason
+            return []
 
 controller :: String
 controller = "zookeeper:controller"
