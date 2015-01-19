@@ -144,14 +144,13 @@ server rzh config =
           in say (show st) >> receiveWait [recvCmd, recvMon]
     void $ loop (State mempty mempty pid proxy')
   where
-    watchCache State{..} _ ChildEvent ZK.ConnectedState (Just node) =
+    watchCache State{..} _ _ ZK.ConnectedState (Just node) =
         proxy $ send spid (ClearCache node)
 
     watchCache _ _ _ _ _ = return ()
 
     reap st@State{..} pid =
      do let names = fromMaybe [] (Map.lookup pid monPids)
-            newCache = foldr Map.delete nodeCache names
         forM_ names $ \name ->
          do let node = servicesNode </> name </> pretty pid
             result <- delete rzh node Nothing
@@ -161,8 +160,7 @@ server rzh config =
                                        ++ " - failed to delete "
                                        ++ node
                   _ -> say $ "Reaped " ++ node
-        return st{monPids = Map.delete pid monPids
-                 ,nodeCache = newCache}
+        return st{monPids = Map.delete pid monPids}
 
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
@@ -227,20 +225,23 @@ getChildPids :: MonadIO m
              -> m (Either String [ProcessId])
 getChildPids rzh node watcher = liftIO $
  do enodes' <- ZK.getChildren rzh node watcher
-    runExceptT $
-     do children <- hoistEither (showEither enodes')
-        forM children $ \child ->
-         do eresult <- liftIO $ ZK.get rzh (node </> child) Nothing
-            case eresult of
-               Left reason ->
-                 do let msg = "Error fetching data for " ++ (node </> child)
-                              ++ " : " ++ show reason
-                    throwE msg
-               Right (Nothing, _) ->
-                 do let msg = "Error fetching data for " ++ (node </> child)
-                              ++ " : data was empty."
-                    throwE msg
-               Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
+    case enodes' of
+        Left NoNodeError -> return $ Right []
+        _ ->
+            runExceptT $
+             do children <- hoistEither (showEither enodes')
+                forM children $ \child ->
+                 do eresult <- liftIO $ ZK.get rzh (node </> child) Nothing
+                    case eresult of
+                       Left reason ->
+                         do let msg = "Error fetching data for " ++ (node </> child)
+                                      ++ " : " ++ show reason
+                            throwE msg
+                       Right (Nothing, _) ->
+                         do let msg = "Error fetching data for " ++ (node </> child)
+                                      ++ " : data was empty."
+                            throwE msg
+                       Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
 
 hoistEither :: Monad m => Either e a -> ExceptT e m a
 hoistEither = ExceptT . return
