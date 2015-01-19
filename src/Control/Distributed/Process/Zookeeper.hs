@@ -39,28 +39,22 @@ import           Control.Distributed.Process              hiding (proxy)
 import           Control.Distributed.Process.Serializable
 
 data Command = Register String ProcessId (SendPort (Either String ()))
-             | WatchSet String [ProcessId]
+             | ClearCache String
              | GetControllerNodeIds (SendPort (Either String [NodeId]))
              | Exit
     deriving (Show, Typeable, Generic)
 
 data State = State
     {
-      watching :: Map String [ProcessId]
+      nodeCache :: Map String [ProcessId]
     -- service nodes to remove each pid from when it exits
     , monPids :: Map ProcessId [String]
+    , spid :: ProcessId
+    , proxy :: Process () -> IO ()
     }
 
 instance Show State where
-    show State{..} = show ("nodes", watching, "monPids", monPids)
-
-data Config = Config
-    { watchPeers :: Bool
-    , watchServices :: [String]
-    }
-
-defaultConfig :: Config
-defaultConfig = Config True []
+    show State{..} = show ("nodes", nodeCache, "monPids", monPids)
 
 instance Binary Command
 
@@ -73,7 +67,7 @@ zkController
 zkController keepers =
  do run <- spawnProxy
     liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
-        run (server rzh defaultConfig)
+        run (server rzh)
   where
     inits rzh SessionEvent ZK.ConnectedState _ =
       void $
@@ -83,14 +77,13 @@ zkController keepers =
 
     inits _ _ _ _ = return ()
 
-server :: Zookeeper -> Config -> Process ()
-server rzh Config{..} =
+server :: Zookeeper -> Process ()
+server rzh =
  do pid <- getSelfPid
     register controller pid
-    proxy <- spawnProxy
+    proxy' <- spawnProxy
     Right _ <- create rzh (controllersNode </> pretty pid)
                           (pidB pid) OpenAclUnsafe [Ephemeral]
-    watching' <- initWatch pid proxy
     let loop st =
           let recvCmd = match $ \command -> case command of
                                   Exit -> return ()
@@ -98,34 +91,12 @@ server rzh Config{..} =
               recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
                                   reap st dead >>= loop
           in say (show st) >> receiveWait [recvCmd, recvMon]
-    void $ loop (State watching' mempty)
+    void $ loop (State mempty mempty pid proxy')
   where
-    initWatch pid proxy =
-     do let watchList = map (servicesNode </>) watchServices
-        let watchList' = if watchPeers
-                            then controllersNode : watchList
-                            else watchList
-        watchThese <- forM watchList' $ \node ->
-             do echildren <- getChildPids rzh node (Just $ watchNode pid proxy)
-                case echildren of
-                    Left reason ->
-                     do say $ "Couldn't fetch peer nodes: " ++ reason
-                        return (node, [])
-                    Right children ->
-                        return (node, children)
-        return $ Map.fromList watchThese
+    watchCache State{..} _ ChildEvent ZK.ConnectedState (Just node) =
+        proxy $ send spid (ClearCache node)
 
-    watchNode pid proxy zh ChildEvent ZK.ConnectedState (Just node) =
-     do epeers <- getChildPids zh node (Just $ watchNode pid proxy)
-        peers <- case epeers of
-                Left reason ->
-                 do proxy . say $
-                        "Failed to fetch PIDs for " ++ node ++ " - " ++ reason
-                    return []
-                Right peers -> return peers
-        proxy $ send pid (WatchSet node peers)
-
-    watchNode _ _ _ _ _ _ = return ()
+    watchCache _ _ _ _ _ = return ()
 
     reap st@State{..} pid =
         let names = fromMaybe [] (Map.lookup pid monPids)
@@ -156,14 +127,21 @@ server rzh Config{..} =
         return st{monPids = Map.insertWith (++) rpid [name] monPids}
 
     handle st@State{..} (GetControllerNodeIds reply) =
-     do epids <- case Map.lookup controllersNode watching of
+     do epids <- case Map.lookup controllersNode nodeCache of
                         Just pids -> return (Right pids)
-                        Nothing -> getChildPids rzh controllersNode Nothing
-        sendChan reply (fmap (map processNodeId) epids)
-        return st
+                        Nothing -> getChildPids rzh controllersNode (Just $ watchCache st)
 
-    handle st@State{..} (WatchSet node pids) =
-        return st{watching = Map.insert node pids watching }
+        let st' = case epids of
+                    Right pids ->
+                        st{nodeCache = Map.insert controllersNode pids nodeCache}
+                    Left _ ->
+                        st{nodeCache = Map.delete controllersNode nodeCache}
+
+        sendChan reply (fmap (map processNodeId) epids)
+        return st'
+
+    handle st@State{..} (ClearCache node) =
+        return st{nodeCache = Map.delete node nodeCache}
 
     handle st Exit = return st
 
