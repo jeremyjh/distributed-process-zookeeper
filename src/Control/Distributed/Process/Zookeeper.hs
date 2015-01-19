@@ -19,8 +19,8 @@ import           Database.Zookeeper                       (AclList (..),
                                                            Watcher)
 import qualified Database.Zookeeper                       as ZK
 
-import Control.Concurrent.MVar
-       (newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
+import Control.Concurrent
+       (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
 import           Control.Exception                        (throwIO)
 import           Control.Monad                            (forM, forM_, join,
                                                            void)
@@ -36,17 +36,21 @@ import qualified Data.Map.Strict                          as Map
 import           Data.Maybe                               (fromMaybe)
 import           Data.Monoid                              (mempty)
 import           Data.Typeable                            (Typeable)
+import Data.List (isPrefixOf)
 import           GHC.Generics                             (Generic)
 
 import           Control.Distributed.Process              hiding (proxy)
+import           Control.Distributed.Process.Management
 import           Control.Distributed.Process.Serializable
+import Control.Applicative ((<$>))
 
 data Command = Register String ProcessId (SendPort (Either String ()))
              | ClearCache String
              | GetRegistered String (SendPort [ProcessId])
-             | GetControllerNodeIds (SendPort [NodeId])
              | Exit
     deriving (Show, Typeable, Generic)
+
+instance Binary Command
 
 data State = State
     {
@@ -57,27 +61,39 @@ data State = State
     , proxy :: Process () -> IO ()
     }
 
+
 instance Show State where
     show State{..} = show ("nodes", nodeCache, "monPids", monPids)
 
-instance Binary Command
+data Config = Config
+    {
+    -- ^ Only register locally registered process names with zookeeper
+    -- if the name begins with the given prefix. Default is "" which will
+    -- register every locally registered process in the Zookeeper services
+    -- node.
+      registerPrefix :: String
+    }
 
--- |Register a name and pid a as service in Zookeeper.
+defaultConfig :: Config
+defaultConfig = Config ""
+
+-- |Register a name and pid a as service in Zookeeper. The controller
+-- will monitor the pid and remove its child node from Zookeeper when it
+-- exits.
 --
 -- Names will be registered at /distributed-process/services/<name>/<pid>
 registerZK :: String -> ProcessId -> Process (Either String ())
-registerZK name rpid =
-    callZK $ Register name rpid
+registerZK name rpid = callZK $ Register name rpid
 
 -- | Get a list of nodes advertised in Zookeeper. These pids are registered
 -- when zkController starts in path
 -- "/distributed-process/controllers/<pid>".
 getPeers :: Process [NodeId]
-getPeers = callZK GetControllerNodeIds
+getPeers = fmap processNodeId <$> callZK (GetRegistered controllersNode)
 
 -- | Returns list of pids registered with the service name.
 getCapable :: String -> Process [ProcessId]
-getCapable = callZK . GetRegistered
+getCapable name = callZK (GetRegistered (servicesNode </> name))
 
 -- | Broadcast a message to a specific service on all registered nodes.
 nsendPeers :: Serializable a => String -> a -> Process ()
@@ -88,7 +104,7 @@ nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service m
 nsendCapable :: Serializable a => String -> a -> Process ()
 nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
--- | Starts a Zookeeper service process, and installs an MXAgent to
+-- | Run a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper.
 zkController
              -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
@@ -97,7 +113,7 @@ zkController
 zkController keepers =
  do run <- spawnProxy
     liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
-        run (server rzh)
+        run (server rzh defaultConfig)
   where
     inits rzh SessionEvent ZK.ConnectedState _ =
       void $
@@ -107,13 +123,18 @@ zkController keepers =
 
     inits _ _ _ _ = return ()
 
-server :: Zookeeper -> Process ()
-server rzh =
+server :: Zookeeper -> Config -> Process ()
+server rzh config =
  do pid <- getSelfPid
     register controller pid
+    watchRegistration config
     proxy' <- spawnProxy
-    Right _ <- create rzh (controllersNode </> pretty pid)
+    regself <- create rzh (controllersNode </> pretty pid)
                           (pidB pid) OpenAclUnsafe [Ephemeral]
+    case regself of
+        Left reason -> liftIO $
+            throwIO (userError $ "Could not register self with Zookeeper: " ++ show reason)
+        Right _ -> return ()
     let loop st =
           let recvCmd = match $ \command -> case command of
                                   Exit -> return ()
@@ -129,17 +150,19 @@ server rzh =
     watchCache _ _ _ _ _ = return ()
 
     reap st@State{..} pid =
-        let names = fromMaybe [] (Map.lookup pid monPids)
-        in do forM_ names $ \name ->
-               do let node = servicesNode </> name </> pretty pid
-                  result <- delete rzh node Nothing
-                  case result of
-                    Left reason -> say $ "Error: "
-                                         ++ show reason
-                                         ++ " - failed to delete "
-                                         ++ node
-                    _ -> say $ "Reaped " ++ node
-              return st{monPids = Map.delete pid monPids}
+     do let names = fromMaybe [] (Map.lookup pid monPids)
+            newCache = foldr Map.delete nodeCache names
+        forM_ names $ \name ->
+         do let node = servicesNode </> name </> pretty pid
+            result <- delete rzh node Nothing
+            case result of
+                  Left reason -> say $ "Error: "
+                                       ++ show reason
+                                       ++ " - failed to delete "
+                                       ++ node
+                  _ -> say $ "Reaped " ++ node
+        return st{monPids = Map.delete pid monPids
+                 ,nodeCache = newCache}
 
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
@@ -156,41 +179,48 @@ server rzh =
         void $ monitor rpid
         return st{monPids = Map.insertWith (++) rpid [name] monPids}
 
-    handle st@State{..} (GetControllerNodeIds reply) =
-     do epids <- case Map.lookup controllersNode nodeCache of
-                        Just pids -> return (Right pids)
-                        Nothing -> getChildPids rzh controllersNode (Just $ watchCache st)
-        case epids of
-            Right pids ->
-             do sendChan reply (map processNodeId pids)
-                return st{nodeCache = Map.insert controllersNode pids nodeCache}
-            Left reason ->
-             do say $  "Retrieval failed for controllers: " ++ reason
-                sendChan reply []
-                return st{nodeCache = Map.delete controllersNode nodeCache}
-
     handle st@State{..} (ClearCache node) =
         return st{nodeCache = Map.delete node nodeCache}
 
     handle st@State{..} (GetRegistered node reply) =
-        let node' = servicesNode </> node in
-     do epids <- case Map.lookup node' nodeCache of
+     do epids <- case Map.lookup node nodeCache of
                         Just pids -> return (Right pids)
-                        Nothing -> getChildPids rzh node' (Just $ watchCache st)
+                        Nothing -> getChildPids rzh node (Just $ watchCache st)
         case epids of
             Right pids ->
              do sendChan reply pids
                 return st{nodeCache = Map.insert node pids nodeCache}
             Left reason ->
-             do say $  "Retrieval failed for node: " ++ node' ++ " - " ++ reason
+             do say $  "Retrieval failed for node: " ++ node ++ " - " ++ reason
                 sendChan reply []
                 return st{nodeCache = Map.delete node nodeCache}
 
-    handle st Exit = return st
+    handle st Exit = return st --satisfy exhaustiveness checker
 
     pretty pid = drop 6 (show pid)
     pidB pid = Just . BL.toStrict $ encode pid
 
+watchRegistration :: Config -> Process ()
+watchRegistration Config{..} = do
+    let initState = [] :: [MxEvent]
+    void $ mxAgent (MxAgentId "zookeeper-name-listener") initState [
+        mxSink $ \ev -> do
+           let act =
+                 case ev of
+                   (MxRegistered _ "zookeeper-name-listener") -> return ()
+                   (MxRegistered pid name')
+                        | prefixed name' -> liftMX $
+                                do ereg <- registerZK name' pid
+                                   case ereg of
+                                       Left reason ->
+                                          say $ "Automatic registration failed for name: "
+                                                ++ name' ++ " - " ++ reason
+                                       _ -> return ()
+                        | otherwise -> return ()
+                   _                   -> return ()
+           act >> mxReady ]
+    liftIO $ threadDelay 10000
+  where prefixed = isPrefixOf registerPrefix
 
 getChildPids :: MonadIO m
              => Zookeeper -> String -> Maybe Watcher
