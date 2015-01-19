@@ -6,6 +6,9 @@ module Control.Distributed.Process.Zookeeper
    ( zkController
    , registerZK
    , getPeers
+   , getCapable
+   , nsendPeers
+   , nsendCapable
    ) where
 
 import           Database.Zookeeper                       (AclList (..),
@@ -40,7 +43,8 @@ import           Control.Distributed.Process.Serializable
 
 data Command = Register String ProcessId (SendPort (Either String ()))
              | ClearCache String
-             | GetControllerNodeIds (SendPort (Either String [NodeId]))
+             | GetRegistered String (SendPort [ProcessId])
+             | GetControllerNodeIds (SendPort [NodeId])
              | Exit
     deriving (Show, Typeable, Generic)
 
@@ -57,6 +61,32 @@ instance Show State where
     show State{..} = show ("nodes", nodeCache, "monPids", monPids)
 
 instance Binary Command
+
+-- |Register a name and pid a as service in Zookeeper.
+--
+-- Names will be registered at /distributed-process/services/<name>/<pid>
+registerZK :: String -> ProcessId -> Process (Either String ())
+registerZK name rpid =
+    callZK $ Register name rpid
+
+-- | Get a list of nodes advertised in Zookeeper. These pids are registered
+-- when zkController starts in path
+-- "/distributed-process/controllers/<pid>".
+getPeers :: Process [NodeId]
+getPeers = callZK GetControllerNodeIds
+
+-- | Returns list of pids registered with the service name.
+getCapable :: String -> Process [ProcessId]
+getCapable = callZK . GetRegistered
+
+-- | Broadcast a message to a specific service on all registered nodes.
+nsendPeers :: Serializable a => String -> a -> Process ()
+nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service msg)
+
+-- | Broadcast a message to a all pids registered with a particular service
+-- name.
+nsendCapable :: Serializable a => String -> a -> Process ()
+nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
 -- | Starts a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper.
@@ -130,18 +160,31 @@ server rzh =
      do epids <- case Map.lookup controllersNode nodeCache of
                         Just pids -> return (Right pids)
                         Nothing -> getChildPids rzh controllersNode (Just $ watchCache st)
-
-        let st' = case epids of
-                    Right pids ->
-                        st{nodeCache = Map.insert controllersNode pids nodeCache}
-                    Left _ ->
-                        st{nodeCache = Map.delete controllersNode nodeCache}
-
-        sendChan reply (fmap (map processNodeId) epids)
-        return st'
+        case epids of
+            Right pids ->
+             do sendChan reply (map processNodeId pids)
+                return st{nodeCache = Map.insert controllersNode pids nodeCache}
+            Left reason ->
+             do say $  "Retrieval failed for controllers: " ++ reason
+                sendChan reply []
+                return st{nodeCache = Map.delete controllersNode nodeCache}
 
     handle st@State{..} (ClearCache node) =
         return st{nodeCache = Map.delete node nodeCache}
+
+    handle st@State{..} (GetRegistered node reply) =
+        let node' = servicesNode </> node in
+     do epids <- case Map.lookup node' nodeCache of
+                        Just pids -> return (Right pids)
+                        Nothing -> getChildPids rzh node' (Just $ watchCache st)
+        case epids of
+            Right pids ->
+             do sendChan reply pids
+                return st{nodeCache = Map.insert node pids nodeCache}
+            Left reason ->
+             do say $  "Retrieval failed for node: " ++ node' ++ " - " ++ reason
+                sendChan reply []
+                return st{nodeCache = Map.delete node nodeCache}
 
     handle st Exit = return st
 
@@ -193,21 +236,6 @@ assertNode _ (Right _) = return ()
 assertNode _ (Left NodeExistsError) = return ()
 assertNode name (Left _) = liftIO $
     throwIO (userError $ "Fatal: could not create node: " ++ name)
-
-
-registerZK :: String -> ProcessId -> Process (Either String ())
-registerZK name rpid =
-    callZK $ Register name rpid
-
--- | Get a list of currently available peer nodes.
-getPeers :: Process [NodeId]
-getPeers =
- do enids <- callZK GetControllerNodeIds
-    case enids of
-        Right nids -> return nids
-        Left reason ->
-         do say $ "getPeers failed: " ++ reason
-            return []
 
 controller :: String
 controller = "zookeeper:controller"
