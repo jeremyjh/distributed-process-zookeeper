@@ -4,11 +4,17 @@
 
 module Control.Distributed.Process.Zookeeper
    ( zkController
+   , zkControllerWith
    , registerZK
    , getPeers
    , getCapable
    , nsendPeers
    , nsendCapable
+   , waitController
+   , Config(..)
+   , defaultConfig
+   , nolog
+   , sayTrace
    ) where
 
 import           Database.Zookeeper                       (AclList (..),
@@ -43,6 +49,7 @@ import           Control.Distributed.Process              hiding (proxy)
 import           Control.Distributed.Process.Management
 import           Control.Distributed.Process.Serializable
 import Control.Applicative ((<$>))
+import Control.DeepSeq (deepseq)
 
 data Command = Register String ProcessId (SendPort (Either String ()))
              | ClearCache String
@@ -67,15 +74,33 @@ instance Show State where
 
 data Config = Config
     {
-    -- ^ Only register locally registered process names with zookeeper
-    -- if the name begins with the given prefix. Default is "" which will
-    -- register every locally registered process in the Zookeeper services
-    -- node.
+      -- ^ Only register locally registered process names with zookeeper
+      -- if the name begins with the given prefix. Default is "" which will
+      -- register every locally registered process in the Zookeeper services
+      -- node.
       registerPrefix :: String
+      -- ^ An operation that will be called for trace level logging.
+      -- 'defaultConfig' uses 'nolog'.
+    , logTrace :: String -> Process ()
+      -- ^ An operation that will be called for error logging.
+      -- 'defaultConfig' uses 'say'
+    , logError :: String -> Process ()
     }
 
+-- | A no-op that can be used for either of the loggers in 'Config'.
+-- Because no actual I/O is performed, it fully evaluates the message so
+-- thunks do not build up.
+nolog :: String -> Process ()
+nolog m = m `deepseq` return ()
+
+-- | Simple formatter for trace output through 'say'.
+sayTrace :: String -> Process ()
+sayTrace = say . ("[C.D.P.Zookeeper: TRACE] - " ++)
+
+-- | By default all local names are registered with zookeeper, and only
+-- error messages are logged through 'say'.
 defaultConfig :: Config
-defaultConfig = Config ""
+defaultConfig = Config "" nolog (say . ("[C.D.P.Zookeeper: ERROR] - " ++))
 
 -- |Register a name and pid a as service in Zookeeper. The controller
 -- will monitor the pid and remove its child node from Zookeeper when it
@@ -105,15 +130,26 @@ nsendCapable :: Serializable a => String -> a -> Process ()
 nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
 -- | Run a Zookeeper service process, and installs an MXAgent to
--- automatically register all local names in Zookeeper.
+-- automatically register all local names in Zookeeper using default
+-- options.
 zkController
              -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
              :: String
              -> Process ()
-zkController keepers =
+zkController = zkControllerWith defaultConfig
+
+-- | As 'zkController' but accept 'Config' options rather than assuming
+-- defaults.
+zkControllerWith
+             :: Config
+             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+             -> String
+
+             -> Process ()
+zkControllerWith config keepers =
  do run <- spawnProxy
     liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
-        run (server rzh defaultConfig)
+        run (server rzh config)
   where
     inits rzh SessionEvent ZK.ConnectedState _ =
       void $
@@ -124,7 +160,7 @@ zkController keepers =
     inits _ _ _ _ = return ()
 
 server :: Zookeeper -> Config -> Process ()
-server rzh config =
+server rzh config@Config{..} =
  do pid <- getSelfPid
     register controller pid
     watchRegistration config
@@ -132,8 +168,9 @@ server rzh config =
     regself <- create rzh (controllersNode </> pretty pid)
                           (pidB pid) OpenAclUnsafe [Ephemeral]
     case regself of
-        Left reason -> liftIO $
-            throwIO (userError $ "Could not register self with Zookeeper: " ++ show reason)
+        Left reason ->
+            let msg = "Could not register self with Zookeeper: " ++ show reason
+            in logError msg >> liftIO (throwIO (userError msg))
         Right _ -> return ()
     let loop st =
           let recvCmd = match $ \command -> case command of
@@ -141,7 +178,7 @@ server rzh config =
                                   _ -> handle st command >>= loop
               recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
                                   reap st dead >>= loop
-          in say (show st) >> receiveWait [recvCmd, recvMon]
+          in logTrace (show st) >> receiveWait [recvCmd, recvMon]
     void $ loop (State mempty mempty pid proxy')
   where
     watchCache State{..} _ _ ZK.ConnectedState (Just node) =
@@ -155,11 +192,10 @@ server rzh config =
          do let node = servicesNode </> name </> pretty pid
             result <- delete rzh node Nothing
             case result of
-                  Left reason -> say $ "Error: "
-                                       ++ show reason
-                                       ++ " - failed to delete "
-                                       ++ node
-                  _ -> say $ "Reaped " ++ node
+                  Left reason -> logError  $ show reason
+                                          ++ " - failed to delete "
+                                          ++ node
+                  _ -> logTrace $ "Reaped " ++ node
         return st{monPids = Map.delete pid monPids}
 
     handle st@State{..} (Register name rpid reply) =
@@ -170,9 +206,11 @@ server rzh config =
                          OpenAclUnsafe [Ephemeral]
         case result of
             Right _ ->
-             do say $ "Registered " ++ node
+             do logTrace $ "Registered " ++ node
                 sendChan reply (Right ())
-            Left reason -> sendChan reply (Left $ show reason)
+            Left reason ->
+             do logError $ "Failed to register name: " ++ node ++ " - " ++ show reason
+                sendChan reply (Left $ show reason)
 
         void $ monitor rpid
         return st{monPids = Map.insertWith (++) rpid [name] monPids}
@@ -189,7 +227,7 @@ server rzh config =
              do sendChan reply pids
                 return st{nodeCache = Map.insert node pids nodeCache}
             Left reason ->
-             do say $  "Retrieval failed for node: " ++ node ++ " - " ++ reason
+             do logError $  "Retrieval failed for node: " ++ node ++ " - " ++ reason
                 sendChan reply []
                 return st{nodeCache = Map.delete node nodeCache}
 
@@ -211,7 +249,7 @@ watchRegistration Config{..} = do
                                 do ereg <- registerZK name' pid
                                    case ereg of
                                        Left reason ->
-                                          say $ "Automatic registration failed for name: "
+                                          logError $ "Automatic registration failed for name: "
                                                 ++ name' ++ " - " ++ reason
                                        _ -> return ()
                         | otherwise -> return ()
@@ -242,6 +280,14 @@ getChildPids rzh node watcher = liftIO $
                                       ++ " : data was empty."
                             throwE msg
                        Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
+
+-- | Wait for zkController to startup and register iteself.
+waitController :: Process ()
+waitController =
+ do res <- whereis controller
+    case res of
+        Nothing -> liftIO (threadDelay 10000) >> waitController
+        Just _ -> return ()
 
 hoistEither :: Monad m => Either e a -> ExceptT e m a
 hoistEither = ExceptT . return
