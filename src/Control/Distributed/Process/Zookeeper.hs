@@ -3,7 +3,8 @@
 {-# LANGUAGE RecordWildCards    #-}
 
 module Control.Distributed.Process.Zookeeper
-   ( zkController
+   (
+     zkController
    , zkControllerWith
    , registerZK
    , getPeers
@@ -44,12 +45,13 @@ import           Data.Monoid                              (mempty)
 import           Data.Typeable                            (Typeable)
 import Data.List (isPrefixOf)
 import           GHC.Generics                             (Generic)
+import Control.Applicative ((<$>))
+import Control.DeepSeq (deepseq)
 
 import           Control.Distributed.Process              hiding (proxy)
 import           Control.Distributed.Process.Management
 import           Control.Distributed.Process.Serializable
-import Control.Applicative ((<$>))
-import Control.DeepSeq (deepseq)
+
 
 data Command = Register String ProcessId (SendPort (Either String ()))
              | ClearCache String
@@ -74,16 +76,16 @@ instance Show State where
 
 data Config = Config
     {
-      -- ^ Only register locally registered process names with zookeeper
+      -- | Only register locally registered process names with zookeeper
       -- if the name begins with the given prefix. Default is "" which will
       -- register every locally registered process in the Zookeeper services
       -- node.
       registerPrefix :: String
-      -- ^ An operation that will be called for trace level logging.
+      -- | An operation that will be called for trace level logging.
       -- 'defaultConfig' uses 'nolog'.
     , logTrace :: String -> Process ()
-      -- ^ An operation that will be called for error logging.
-      -- 'defaultConfig' uses 'say'
+      -- | An operation that will be called for error logging.
+      -- jdefaultConfig' uses 'say'
     , logError :: String -> Process ()
     }
 
@@ -102,25 +104,45 @@ sayTrace = say . ("[C.D.P.Zookeeper: TRACE] - " ++)
 defaultConfig :: Config
 defaultConfig = Config "" nolog (say . ("[C.D.P.Zookeeper: ERROR] - " ++))
 
--- |Register a name and pid a as service in Zookeeper. The controller
+-- |Register a name and pid as a service in Zookeeper. The controller
 -- will monitor the pid and remove its child node from Zookeeper when it
 -- exits.
 --
--- Names will be registered at /distributed-process/services/<name>/<pid>
+-- Names will be registered at "/distributed-process/services/<name>/<pid>"
+--
+-- Note: By default all locally registered names (using 'register') will be
+-- registered in Zookeeper under the same name by an MxAgent process. Use
+-- this function if you want to register an anonymous pid or using
+-- a different name - or if you are using a prefix to exclude the automatic
+-- registration (see 'Config').
 registerZK :: String -> ProcessId -> Process (Either String ())
 registerZK name rpid = callZK $ Register name rpid
 
--- | Get a list of nodes advertised in Zookeeper. These pids are registered
--- when zkController starts in path
+-- | Get a list of nodes advertised in Zookeeper. These are registered
+-- when 'zkController' starts in path
 -- "/distributed-process/controllers/<pid>".
+--
+-- Note: this is included for API compatibility with P2P but its usage
+-- would suggest discovery patterns that could be made more efficient
+-- when using Zookeeper - e.g. just use (automatic) advertisement and getCapable.
 getPeers :: Process [NodeId]
 getPeers = fmap processNodeId <$> callZK (GetRegistered controllersNode)
 
 -- | Returns list of pids registered with the service name.
+--
+-- Results are cached by the controller until they are invalidated by
+-- subsequent changes to the service node in Zookeeper, which is
+-- communicated through a 'Watcher'. Data will be fetched from Zookeeper
+-- only when it is changed and then requested again.
 getCapable :: String -> Process [ProcessId]
 getCapable name = callZK (GetRegistered (servicesNode </> name))
 
 -- | Broadcast a message to a specific service on all registered nodes.
+--
+-- Note: this is included for API compatibility with P2P but its usage
+-- would suggest discovery patterns that could be made more efficient
+-- when using Zookeeper - e.g. just use getCapable to
+-- send a broadcast directly to the registered process on each node.
 nsendPeers :: Serializable a => String -> a -> Process ()
 nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service msg)
 
@@ -132,20 +154,15 @@ nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 -- | Run a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper using default
 -- options.
-zkController
-             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-             :: String
+zkController :: String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
              -> Process ()
 zkController = zkControllerWith defaultConfig
 
 -- | As 'zkController' but accept 'Config' options rather than assuming
 -- defaults.
-zkControllerWith
-             :: Config
-             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-             -> String
-
-             -> Process ()
+zkControllerWith :: Config
+                 -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+                 -> Process ()
 zkControllerWith config keepers =
  do run <- spawnProxy
     liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
