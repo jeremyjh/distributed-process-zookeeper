@@ -54,7 +54,8 @@ test-suite spec
         deepseq,
         monad-control,
         network-transport,
-        network-transport-tcp
+        network-transport-tcp,
+        transformers
     type: exitcode-stdio-1.0
     main-is: Spec.hs
     buildable: True

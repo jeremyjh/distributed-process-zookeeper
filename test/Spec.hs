@@ -15,6 +15,7 @@ import Control.Distributed.Process.Node (initRemoteTable)
 import Control.DeepSeq (NFData)
 import Control.Monad.Trans.Control (MonadBaseControl)
 import Control.Monad (void)
+import Control.Monad.IO.Class (MonadIO)
 import Control.Exception.Enclosed (tryAnyDeep)
 import Control.Exception.Lifted (throw)
 
@@ -34,7 +35,7 @@ spec = do
     describe "Test harness" $ do
 
             it "can do basic Process messaging" $ do
-                testBoot "3030" $  do
+                testBoot $  do
                     parent <- getSelfPid
                     child <- spawnLocal $ do
                         saysee <- texpect :: Process String
@@ -46,24 +47,82 @@ spec = do
 
     describe "C.D.P. Zookeeper" $ do
 
-            it "can do basic Process messaging" $ do
-                testBoot "3030" $  do
-                    parent <- getSelfPid
-                    child <- spawnLocal $ do
-                        saysee <- texpect :: Process String
-                        send parent ("I said: " ++ saysee)
-                    send child "foo"
-                    said <- texpect :: Process String
-                    return said
-                `shouldReturn` "I said: foo"
+            it "will register local names with zookeeper" $ do
+                testBoot $  do
+                    self <- getSelfPid
+                    register "testy" self
+                    threadDelay 10000
+                    [found] <- getCapable "testy"
+                    return (found == self)
+                `shouldReturn` True
+
+            it "will only register prefixed local names if configured" $ do
+                testBootWith defaultConfig {registerPrefix = "zk:"}  $  do
+                    self <- getSelfPid
+                    register "testr" self
+                    register "zk:testr2" self
+                    threadDelay 10000
+                    [] <- getCapable "testr"
+                    [found] <- getCapable "zk:testr2"
+                    return (found == self)
+                `shouldReturn` True
+
+            it "enables broadcast to specific services" $ do
+                testBoot $ do
+                    one <- newEmptyMVar
+                    two <- newEmptyMVar
+                    let slave mv = void $ fork $ testBoot $
+                           do self <- getSelfPid
+                              register "test-broadcast" self
+                              threadDelay 50000 --finish registration
+                              putMVar mv ()
+                              "foundme" <- expect
+                              putMVar mv ()
+                    slave one
+                    slave two
+                    takeMVar one
+                    takeMVar two --hopefully they are both registered by now!
+                    nsendCapable "test-broadcast" "foundme"
+                    takeMVar one
+                    takeMVar two
+                `shouldReturn` ()
+
+            it "enables broadcast to all nodes" $ do
+                testBoot $ do
+                    one <- newEmptyMVar
+                    two <- newEmptyMVar
+                    let slave mv = void $ fork $ testBoot $
+                           do self <- getSelfPid
+                              register "test-broadcast" self
+                              threadDelay 50000 --finish registration
+                              putMVar mv ()
+                              "foundme" <- expect
+                              putMVar mv ()
+                    slave one
+                    slave two
+                    takeMVar one
+                    takeMVar two --hopefully they are both registered by now!
+                    nsendPeers "test-broadcast" "foundme"
+                    takeMVar one
+                    takeMVar two
+                `shouldReturn` ()
 
 zookeepers = "localhost:2181"
 
+testBoot :: (MonadBaseControl IO io, MonadIO io, NFData a)
+         => Process a -> io a
+testBoot = testBootWith defaultConfig
 
-testBoot port ma = testProcessTimeout 1000 ma
-                                      (liftIO . bootstrap "localhost"
-                                                          port zookeepers
-                                                          initRemoteTable)
+testBootWith :: (MonadBaseControl IO io, MonadIO io, NFData a)
+             => Config -> Process a -> io a
+testBootWith config ma = testProcessTimeout 1000 (waitController >> ma >>= waitReturn )
+                                      (liftIO . bootstrapWith config
+                                                              "localhost"
+                                                              "0"
+                                                              zookeepers
+                                                              initRemoteTable)
+
+waitReturn a = do threadDelay 100000; return a
 
 testProcessTimeout :: (NFData a, MonadBaseControl IO io)
                 => Int -> Process a -> (Process () -> io ()) -> io a
@@ -102,7 +161,7 @@ bootstrap
           -> RemoteTable
           -> Process () -- ^ Process computation to run in the new node.
           -> IO ()
-bootstrap = bootstrapWith defaultConfig
+bootstrap = bootstrapWith defaultConfig --{logTrace = sayTrace}
 
 bootstrapWith
           :: Config
