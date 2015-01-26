@@ -6,6 +6,8 @@ module Control.Distributed.Process.Zookeeper
    (
      zkController
    , zkControllerWith
+   , bootstrap
+   , bootstrapWith
    , registerZK
    , getPeers
    , getCapable
@@ -28,7 +30,7 @@ import qualified Database.Zookeeper                       as ZK
 
 import Control.Concurrent
        (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
-import           Control.Exception                        (throwIO)
+import           Control.Exception                        (throwIO, bracket)
 import           Control.Monad                            (forM, forM_, join,
                                                            void)
 import           Control.Monad.Except                     (ExceptT (..))
@@ -48,9 +50,16 @@ import           GHC.Generics                             (Generic)
 import Control.Applicative ((<$>))
 import Control.DeepSeq (deepseq)
 
-import           Control.Distributed.Process              hiding (proxy)
+import           Control.Distributed.Process              hiding (proxy, bracket)
 import           Control.Distributed.Process.Management
 import           Control.Distributed.Process.Serializable
+import Control.Distributed.Process.Node
+       (newLocalNode, runProcess)
+import Network (HostName)
+import Network.Socket (ServiceName)
+import Network.Transport.TCP
+       (createTransport, defaultTCPParameters)
+import Network.Transport (closeTransport)
 
 
 data Command = Register String ProcessId (SendPort (Either String ()))
@@ -362,3 +371,38 @@ create z n d a = liftIO . ZK.create z n d a
 
 delete :: MonadIO m => Zookeeper -> String -> Maybe ZK.Version -> m (Either ZKError ())
 delete z n = liftIO . ZK.delete z n
+
+bootstrap
+          -- ^ Hostname or IP this Cloud Haskell node will listen on.
+          :: HostName
+             -- ^ Port or port name this node will listen on.
+          -> ServiceName
+             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+          -> String
+          -> RemoteTable
+          -> Process () -- ^ Process computation to run in the new node.
+          -> IO ()
+bootstrap = bootstrapWith defaultConfig --{logTrace = sayTrace}
+
+bootstrapWith
+          :: Config
+          -- ^ Hostname or IP this Cloud Haskell node will listen on.
+          -> HostName
+             -- ^ Port or port name this node will listen on.
+          -> ServiceName
+             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+          -> String
+          -> RemoteTable -> Process () -> IO ()
+bootstrapWith config host port zservs rtable proc =
+    bracket acquire release exec
+  where
+    acquire =
+     do Right tcp <- createTransport host port defaultTCPParameters
+        return tcp
+    exec tcp =
+       do node <- newLocalNode tcp rtable
+          runProcess node $
+           do void $ spawnLocal (zkControllerWith config zservs)
+              waitController
+              proc
+    release = closeTransport

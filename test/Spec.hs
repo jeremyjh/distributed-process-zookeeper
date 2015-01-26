@@ -8,7 +8,6 @@ import           Test.Hspec
 import           Control.Concurrent.Lifted
 import           Control.Distributed.Process.MonadBaseControl()
 import           Control.Distributed.Process hiding (bracket)
-import           Control.Exception (bracket)
 import           Control.Distributed.Process.Zookeeper
 import           Control.Distributed.Process.Serializable (Serializable)
 import Control.Distributed.Process.Node (initRemoteTable)
@@ -18,14 +17,6 @@ import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Exception.Enclosed (tryAnyDeep)
 import Control.Exception.Lifted (throw)
-
-import Control.Distributed.Process.Node
-       (newLocalNode, runProcess)
-import Network (HostName)
-import Network.Socket (ServiceName)
-import Network.Transport.TCP
-       (createTransport, defaultTCPParameters)
-import Network.Transport (closeTransport)
 
 main :: IO ()
 main = hspec spec
@@ -151,37 +142,3 @@ texpect = do
         Nothing -> error "Timed out in test expect"
         Just v -> return v
 
-bootstrap
-          -- ^ Hostname or IP this Cloud Haskell node will listen on.
-          :: HostName
-             -- ^ Port or port name this node will listen on.
-          -> ServiceName
-             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-          -> String
-          -> RemoteTable
-          -> Process () -- ^ Process computation to run in the new node.
-          -> IO ()
-bootstrap = bootstrapWith defaultConfig --{logTrace = sayTrace}
-
-bootstrapWith
-          :: Config
-          -- ^ Hostname or IP this Cloud Haskell node will listen on.
-          -> HostName
-             -- ^ Port or port name this node will listen on.
-          -> ServiceName
-             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-          -> String
-          -> RemoteTable -> Process () -> IO ()
-bootstrapWith config host port zservs rtable proc =
-    bracket acquire release exec
-  where
-    acquire =
-     do Right tcp <- createTransport host port defaultTCPParameters
-        return tcp
-    exec tcp =
-       do node <- newLocalNode tcp rtable
-          runProcess node $
-           do void $ spawnLocal (zkControllerWith config zservs)
-              waitController
-              proc
-    release = closeTransport

@@ -31,12 +31,15 @@ library
   build-depends:       base >=4.6 && <4.8
                      , hzk >= 2.1.0
                      , distributed-process
+                     , network-transport
+                     , network-transport-tcp 
                      , binary
                      , bytestring
                      , containers
                      , transformers >= 0.4
                      , mtl
                      , deepseq 
+                     , network
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options:         -Wall
