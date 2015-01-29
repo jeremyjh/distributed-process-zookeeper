@@ -9,6 +9,7 @@ import           Control.Concurrent.Lifted
 import           Control.Distributed.Process.MonadBaseControl()
 import           Control.Distributed.Process hiding (bracket)
 import           Control.Distributed.Process.Zookeeper
+import           Control.Distributed.Process.Closure
 import           Control.Distributed.Process.Serializable (Serializable)
 import Control.Distributed.Process.Node (initRemoteTable)
 import Control.DeepSeq (NFData)
@@ -80,17 +81,15 @@ spec = do
 
             it "enables broadcast to all nodes" $ do
                 testBoot $ do
-                    one <- newEmptyMVar
-                    two <- newEmptyMVar
-                    let slave mv = void $ fork $ testBoot $
+                    let slave mv =
                            do self <- getSelfPid
                               register "test-broadcast" self
                               threadDelay 50000 --finish registration
                               putMVar mv ()
                               "foundme" <- expect
                               putMVar mv ()
-                    slave one
-                    slave two
+                    one <- forkSlave slave
+                    two <- forkSlave slave
                     takeMVar one
                     takeMVar two --hopefully they are both registered by now!
                     nsendPeers "test-broadcast" "foundme"
@@ -98,11 +97,64 @@ spec = do
                     takeMVar two
                 `shouldReturn` ()
 
+            it "will run a single process with a global name" $ do
+                testBoot $ do
+                    pid <- getSelfPid
+                    let cu =
+                            returnCP sdictUnit ()
+                            `bindCP` cpSend sdictUnit pid
+                            `seqCP` cpExpect sdictUnit
+                    let racer mv =
+                           do void $ registerCandidate "test-global" cu
+                              putMVar mv ()
+                              expect :: Process ()
+
+                    one <- forkSlave racer
+                    two <- forkSlave racer
+                    takeMVar one
+                    takeMVar two
+                    -- we should only get one
+                    () <- expect :: Process ()
+                    expectTimeout 100000
+                `shouldReturn` (Nothing :: Maybe ())
+
+            it "will elect a new global when one exits" $ do
+                testBoot $ do
+                    pid <- getSelfPid
+                    let cu =
+                            returnCP sdictUnit ()
+                            `bindCP` cpSend sdictUnit pid
+                            `seqCP` cpExpect sdictUnit
+
+                    let racer mv =
+                           do gpid <- registerCandidate "test-global2" cu
+                              putMVar mv gpid
+                              expect :: Process ()
+
+                    one <- forkSlave racer
+                    two <- forkSlave racer
+                    three <- forkSlave racer
+                    gpid <- takeMVar one
+                    void $ takeMVar two
+                    void $ takeMVar three
+                    exit gpid "because"
+                    -- make sure only ONE candidate is elected on exit of
+                    -- first
+                    () <- expect :: Process ()
+                    () <- expect :: Process ()
+                    expectTimeout 100000
+                `shouldReturn` (Nothing :: Maybe ())
+
 zookeepers = "localhost:2181"
+
+forkSlave ma =
+ do mv <- newEmptyMVar
+    void $ fork $ testBoot (ma mv)
+    return mv
 
 testBoot :: (MonadBaseControl IO io, MonadIO io, NFData a)
          => Process a -> io a
-testBoot = testBootWith defaultConfig
+testBoot = testBootWith defaultConfig -- {logTrace = sayTrace}
 
 testBootWith :: (MonadBaseControl IO io, MonadIO io, NFData a)
              => Config -> Process a -> io a

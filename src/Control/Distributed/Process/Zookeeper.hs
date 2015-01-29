@@ -13,6 +13,7 @@ module Control.Distributed.Process.Zookeeper
    , getCapable
    , nsendPeers
    , nsendCapable
+   , registerCandidate
    , waitController
    , Config(..)
    , defaultConfig
@@ -31,9 +32,8 @@ import qualified Database.Zookeeper                       as ZK
 import Control.Concurrent
        (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
 import           Control.Exception                        (throwIO, bracket)
-import           Control.Monad                            (forM, forM_, join,
-                                                           void)
-import           Control.Monad.Except                     (ExceptT (..))
+import Control.Monad (forM, forM_, join, void, (<=<))
+import Control.Monad.Except (ExceptT(..), lift)
 import           Control.Monad.IO.Class                   (MonadIO)
 import           Control.Monad.Trans.Except               (runExceptT, throwE)
 import           Data.Binary                              (Binary, decode,
@@ -45,7 +45,7 @@ import qualified Data.Map.Strict                          as Map
 import           Data.Maybe                               (fromMaybe)
 import           Data.Monoid                              (mempty)
 import           Data.Typeable                            (Typeable)
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sort)
 import           GHC.Generics                             (Generic)
 import Control.Applicative ((<$>))
 import Control.DeepSeq (deepseq)
@@ -63,6 +63,8 @@ import Network.Transport (closeTransport)
 
 
 data Command = Register String ProcessId (SendPort (Either String ()))
+             | GlobalCandidate String (Closure (Process ())) (SendPort ProcessId)
+             | CheckCandidate String
              | ClearCache String
              | GetRegistered String (SendPort [ProcessId])
              | Exit
@@ -70,13 +72,18 @@ data Command = Register String ProcessId (SendPort (Either String ()))
 
 instance Binary Command
 
+data Elect = Elect deriving (Typeable, Generic)
+instance Binary Elect
+
 data State = State
     {
       nodeCache :: Map String [ProcessId]
     -- service nodes to remove each pid from when it exits
-    , monPids :: Map ProcessId [String]
+    , monPids :: Map ProcessId ([String],[String])
+    , candidates :: Map String (String, ProcessId)
     , spid :: ProcessId
     , proxy :: Process () -> IO ()
+    , conn :: Zookeeper
     }
 
 
@@ -160,6 +167,9 @@ nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service m
 nsendCapable :: Serializable a => String -> a -> Process ()
 nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
+registerCandidate :: String -> Closure (Process ()) -> Process ProcessId
+registerCandidate name clos = callZK (GlobalCandidate name clos)
+
 -- | Run a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper using default
 -- options.
@@ -178,10 +188,11 @@ zkControllerWith config keepers =
         run (server rzh config)
   where
     inits rzh SessionEvent ZK.ConnectedState _ =
-      void $
-       do create rzh rootNode Nothing OpenAclUnsafe [] >>= assertNode rootNode
-          create rzh servicesNode Nothing OpenAclUnsafe [] >>= assertNode servicesNode
-          create rzh controllersNode Nothing OpenAclUnsafe [] >>= assertNode controllersNode
+      void $ runExceptT $
+       do createAssert rzh rootNode Nothing OpenAclUnsafe []
+          createAssert rzh servicesNode Nothing OpenAclUnsafe []
+          createAssert rzh controllersNode Nothing OpenAclUnsafe []
+          createAssert rzh globalsNode Nothing OpenAclUnsafe []
 
     inits _ _ _ _ = return ()
 
@@ -191,8 +202,8 @@ server rzh config@Config{..} =
     register controller pid
     watchRegistration config
     proxy' <- spawnProxy
-    regself <- create rzh (controllersNode </> pretty pid)
-                          (pidB pid) OpenAclUnsafe [Ephemeral]
+    regself <- runExceptT $ create rzh (controllersNode </> pretty pid)
+                          (pidBytes pid) OpenAclUnsafe [Ephemeral]
     case regself of
         Left reason ->
             let msg = "Could not register self with Zookeeper: " ++ show reason
@@ -201,11 +212,21 @@ server rzh config@Config{..} =
     let loop st =
           let recvCmd = match $ \command -> case command of
                                   Exit -> return ()
-                                  _ -> handle st command >>= loop
+                                  _ ->
+                                    do eresult <- runExceptT $ handle st command
+                                       case eresult of
+                                           Right st' ->
+                                              do logTrace $ "State of: " ++ show st' ++ " - after - "
+                                                           ++ show command
+                                                 loop st'
+                                           Left reason ->
+                                              do logError $ "Error handling: " ++ show command
+                                                            ++ " : " ++ show reason
+                                                 loop st
               recvMon = match $ \(ProcessMonitorNotification _ dead _) ->
                                   reap st dead >>= loop
           in logTrace (show st) >> receiveWait [recvCmd, recvMon]
-    void $ loop (State mempty mempty pid proxy')
+    void $ loop (State mempty mempty mempty pid proxy' rzh)
   where
     watchCache State{..} _ _ ZK.ConnectedState (Just node) =
         proxy $ send spid (ClearCache node)
@@ -213,33 +234,40 @@ server rzh config@Config{..} =
     watchCache _ _ _ _ _ = return ()
 
     reap st@State{..} pid =
-     do let names = fromMaybe [] (Map.lookup pid monPids)
-        forM_ names $ \name ->
-         do let node = servicesNode </> name </> pretty pid
-            result <- delete rzh node Nothing
+     do let (services, globals) = fromMaybe ([],[]) (Map.lookup pid monPids)
+        forM_ services $ \name ->
+            deleteNode (servicesNode </> name </> pretty pid)
+        forM_ globals $ \name ->
+            deleteNode (globalsNode </> name)
+
+        return st{monPids = Map.delete pid monPids}
+      where
+        deleteNode node =
+         do result <- runExceptT $ delete rzh node Nothing
             case result of
                   Left reason -> logError  $ show reason
                                           ++ " - failed to delete "
                                           ++ node
                   _ -> logTrace $ "Reaped " ++ node
-        return st{monPids = Map.delete pid monPids}
 
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
-        create rzh (servicesNode </> name)
-                    Nothing OpenAclUnsafe [] >>= assertNode name
-        result <- create rzh node (pidB rpid)
+        createAssert rzh (servicesNode </> name) Nothing OpenAclUnsafe []
+        result <- runExceptT $ create rzh node (pidBytes rpid)
                          OpenAclUnsafe [Ephemeral]
         case result of
-            Right _ ->
+            Right _ -> lift $
              do logTrace $ "Registered " ++ node
                 sendChan reply (Right ())
-            Left reason ->
+                void $ monitor rpid
+                let apService (a',b') (a, b) = (a' ++ a, b' ++ b)
+                return st{monPids = Map.insertWith apService rpid ([name],[]) monPids}
+            Left reason -> lift $
              do logError $ "Failed to register name: " ++ node ++ " - " ++ show reason
                 sendChan reply (Left $ show reason)
+                return st
 
-        void $ monitor rpid
-        return st{monPids = Map.insertWith (++) rpid [name] monPids}
+
 
     handle st@State{..} (ClearCache node) =
         return st{nodeCache = Map.delete node nodeCache}
@@ -248,7 +276,7 @@ server rzh config@Config{..} =
      do epids <- case Map.lookup node nodeCache of
                         Just pids -> return (Right pids)
                         Nothing -> getChildPids rzh node (Just $ watchCache st)
-        case epids of
+        lift $ case epids of
             Right pids ->
              do sendChan reply pids
                 return st{nodeCache = Map.insert node pids nodeCache}
@@ -257,32 +285,109 @@ server rzh config@Config{..} =
                 sendChan reply []
                 return st{nodeCache = Map.delete node nodeCache}
 
+    handle st (GlobalCandidate n c r) = handleGlobalCandidate config st n c r
+
+    handle st@State{..} (CheckCandidate name) =
+        case Map.lookup name candidates of
+            Just (myid, staged) -> snd `fmap` mayElect st name myid staged
+            Nothing             -> return st
+
     handle st Exit = return st --satisfy exhaustiveness checker
 
     pretty pid = drop 6 (show pid)
-    pidB pid = Just . BL.toStrict $ encode pid
 
-watchRegistration :: Config -> Process ()
-watchRegistration Config{..} = do
-    let initState = [] :: [MxEvent]
-    void $ mxAgent (MxAgentId "zookeeper-name-listener") initState [
-        mxSink $ \ev -> do
-           let act =
-                 case ev of
-                   (MxRegistered _ "zookeeper-name-listener") -> return ()
-                   (MxRegistered pid name')
-                        | prefixed name' -> liftMX $
-                                do ereg <- registerZK name' pid
-                                   case ereg of
-                                       Left reason ->
-                                          logError $ "Automatic registration failed for name: "
-                                                ++ name' ++ " - " ++ reason
-                                       _ -> return ()
-                        | otherwise -> return ()
-                   _                   -> return ()
-           act >> mxReady ]
-    liftIO $ threadDelay 10000
-  where prefixed = isPrefixOf registerPrefix
+handleGlobalCandidate :: Config -> State
+                      -> String -> Closure (Process ()) -> SendPort ProcessId
+                      -> ExceptT ZKError Process State
+handleGlobalCandidate Config{..} st@State{..} name clos reply
+    | Just (myid, staged) <- Map.lookup name candidates =
+        case Map.lookup (globalsNode </> name) nodeCache of
+            Just (pid : _) -> lift $ sendChan reply pid >> return st
+            _              -> respondElect myid staged
+    | otherwise =
+         do proc <- lift $ unClosure clos
+            staged <- lift $ spawnLocal $ (expect :: Process Elect) >> proc
+            myid <- registerGlobalId staged
+            respondElect myid staged
+      where
+        respondElect myid staged =
+         do (pid, st') <- mayElect st name myid staged
+            lift $ sendChan reply pid
+            return st'
+
+        registerGlobalId staged =
+         do let pname = globalsNode </> name
+            createAssert conn pname Nothing OpenAclUnsafe []
+            node <- create conn (pname </> "")
+                                (pidBytes staged)
+                                OpenAclUnsafe
+                                [Ephemeral, Sequence]
+            return $ extractId node
+          where
+            extractId s = trimId (reverse s) ""
+              where
+                trimId [] _ = error $ "end of string without delimiter / in " ++ s
+                trimId ('/' : _) str = str
+                trimId (n : rest) str = trimId rest (n : str)
+
+mayElect :: State -> String -> String -> ProcessId -> ExceptT ZKError Process (ProcessId, State)
+mayElect st@State{..} name myid staged =
+ do others <- sort `fmap` getGlobalIds conn name
+    let first : _ = others
+    if myid == first
+        then
+         do lift $ send staged Elect
+            lift $ void $ monitor staged
+            return (staged, stCacheMon)
+        else
+         do let prev = findPrev others
+            watchFirst <- if prev == first then return $ Just watchPid
+                          else do void $ liftIO (ZK.exists
+                                                    conn
+                                                    (globalsNode </> name </> prev)
+                                                    (Just watchPid)) >>= hoistEither
+                                  return Nothing
+            pid <- getPid conn (globalsNode </> name </> first) watchFirst
+            return (pid, stCache)
+  where
+    findPrev (prev : next : rest) = if next == myid
+                                       then prev
+                                       else findPrev (next : rest)
+    findPrev _ = error "impossible: couldn't find myself in election"
+    watchPid _ ZK.DeletedEvent ZK.ConnectedState _ =
+        proxy $ send spid (CheckCandidate name)
+    watchPid _ _ _ _ = return ()
+
+    stCandidate = st{candidates = Map.insert name (myid, staged) candidates}
+    stCache = stCandidate {nodeCache = Map.insert (globalsNode </> name) [staged] nodeCache}
+    stCacheMon =
+         let apGlobal (a', b') (a, b) = (a' ++ a, b' ++ b) in
+         st{ candidates = Map.delete name candidates
+           , monPids = Map.insertWith apGlobal
+                                      staged
+                                      ([],[name </> myid]) monPids
+           , nodeCache = Map.insert (globalsNode </> name) [staged] nodeCache
+           }
+
+getGlobalIds :: MonadIO m
+             => Zookeeper -> String -> ExceptT ZKError m [String]
+getGlobalIds conn name = liftIO $
+ do echildren <- ZK.getChildren conn (globalsNode </> name) Nothing
+    case echildren of
+        Left reason ->
+         do putStrLn $ "Could not fetch globals for " ++ name ++ " - " ++ show reason
+            return []
+        Right children -> return children
+
+getPid :: MonadIO m
+       => Zookeeper -> String -> Maybe Watcher
+       -> ExceptT ZKError m ProcessId
+getPid conn name watcher =
+ do res <- liftIO $ ZK.get conn name watcher
+    case res of
+        Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
+        Right _ -> throwE NothingError
+        Left reason -> throwE reason
 
 getChildPids :: MonadIO m
              => Zookeeper -> String -> Maybe Watcher
@@ -306,6 +411,28 @@ getChildPids rzh node watcher = liftIO $
                                       ++ " : data was empty."
                             throwE msg
                        Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
+
+watchRegistration :: Config -> Process ()
+watchRegistration Config{..} = do
+    let initState = [] :: [MxEvent]
+    void $ mxAgent (MxAgentId "zookeeper-name-listener") initState [
+        mxSink $ \ev -> do
+           let act =
+                 case ev of
+                   (MxRegistered _ "zookeeper-name-listener") -> return ()
+                   (MxRegistered pid name')
+                        | prefixed name' -> liftMX $
+                                do ereg <- registerZK name' pid
+                                   case ereg of
+                                       Left reason ->
+                                          logError $ "Automatic registration failed for name: "
+                                                ++ name' ++ " - " ++ reason
+                                       _ -> return ()
+                        | otherwise -> return ()
+                   _                   -> return ()
+           act >> mxReady ]
+    liftIO $ threadDelay 10000
+  where prefixed = isPrefixOf registerPrefix
 
 -- | Wait for zkController to startup and register iteself.
 waitController :: Process ()
@@ -331,14 +458,25 @@ servicesNode = rootNode </> "services"
 controllersNode :: String
 controllersNode = rootNode </> "controllers"
 
+globalsNode :: String
+globalsNode = rootNode </> "globals"
+
 rootNode :: String
 rootNode = "/distributed-process"
 
-assertNode :: MonadIO m => String -> Either ZKError t -> m ()
-assertNode _ (Right _) = return ()
-assertNode _ (Left NodeExistsError) = return ()
-assertNode name (Left _) = liftIO $
-    throwIO (userError $ "Fatal: could not create node: " ++ name)
+createAssert :: MonadIO m
+             => Zookeeper -> String -> Maybe BS.ByteString -> AclList -> [CreateFlag]
+             -> ExceptT ZKError m ()
+createAssert z name d a f = assertNode (create z name d a f)
+  where
+    assertNode ema = lift $ runExceptT ema >>= eitherExists
+    eitherExists (Right _)  = return ()
+    eitherExists (Left NodeExistsError) = return ()
+    eitherExists (Left _) = liftIO $
+        throwIO (userError $ "Fatal: could not create node: " ++ name)
+
+pidBytes :: ProcessId -> Maybe BS.ByteString
+pidBytes = Just . BL.toStrict . encode
 
 controller :: String
 controller = "zookeeper:controller"
@@ -366,11 +504,11 @@ spawnProxy =
     return $ \f -> putMVar action f >> takeMVar result
 
 create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
-       -> AclList -> [CreateFlag] -> m (Either ZKError String)
-create z n d a = liftIO . ZK.create z n d a
+       -> AclList -> [CreateFlag] -> ExceptT ZKError m String
+create z n d a = hoistEither <=< liftIO . ZK.create z n d a
 
-delete :: MonadIO m => Zookeeper -> String -> Maybe ZK.Version -> m (Either ZKError ())
-delete z n = liftIO . ZK.delete z n
+delete :: MonadIO m => Zookeeper -> String -> Maybe ZK.Version -> ExceptT ZKError m ()
+delete z n = hoistEither <=< liftIO . ZK.delete z n
 
 bootstrap
           -- ^ Hostname or IP this Cloud Haskell node will listen on.
