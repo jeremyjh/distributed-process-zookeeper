@@ -127,7 +127,7 @@ spec = do
                             `seqCP` cpExpect sdictUnit
 
                     let racer mv =
-                           do gpid <- registerCandidate "test-global2" cu
+                           do Right gpid <- registerCandidate "test-global2" cu
                               putMVar mv gpid
                               expect :: Process ()
 

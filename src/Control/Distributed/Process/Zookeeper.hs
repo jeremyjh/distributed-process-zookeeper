@@ -32,7 +32,7 @@ import qualified Database.Zookeeper                       as ZK
 import Control.Concurrent
        (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
 import           Control.Exception                        (throwIO, bracket)
-import Control.Monad (forM, forM_, join, void, (<=<))
+import Control.Monad (forM, forM_, join, void)
 import Control.Monad.Except (ExceptT(..), lift)
 import           Control.Monad.IO.Class                   (MonadIO)
 import           Control.Monad.Trans.Except               (runExceptT, throwE)
@@ -63,7 +63,7 @@ import Network.Transport (closeTransport)
 
 
 data Command = Register String ProcessId (SendPort (Either String ()))
-             | GlobalCandidate String (Closure (Process ())) (SendPort ProcessId)
+             | GlobalCandidate String (Closure (Process ())) (SendPort (Either String ProcessId))
              | CheckCandidate String
              | ClearCache String
              | GetRegistered String (SendPort [ProcessId])
@@ -167,7 +167,7 @@ nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service m
 nsendCapable :: Serializable a => String -> a -> Process ()
 nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
-registerCandidate :: String -> Closure (Process ()) -> Process ProcessId
+registerCandidate :: String -> Closure (Process ()) -> Process (Either String ProcessId)
 registerCandidate name clos = callZK (GlobalCandidate name clos)
 
 -- | Run a Zookeeper service process, and installs an MXAgent to
@@ -188,11 +188,15 @@ zkControllerWith config keepers =
         run (server rzh config)
   where
     inits rzh SessionEvent ZK.ConnectedState _ =
-      void $ runExceptT $
-       do createAssert rzh rootNode Nothing OpenAclUnsafe []
-          createAssert rzh servicesNode Nothing OpenAclUnsafe []
-          createAssert rzh controllersNode Nothing OpenAclUnsafe []
-          createAssert rzh globalsNode Nothing OpenAclUnsafe []
+      do esetup <- runExceptT $
+           do createAssert rzh rootNode Nothing OpenAclUnsafe []
+              createAssert rzh servicesNode Nothing OpenAclUnsafe []
+              createAssert rzh controllersNode Nothing OpenAclUnsafe []
+              createAssert rzh globalsNode Nothing OpenAclUnsafe []
+         case esetup of
+            Right _ -> return ()
+            Left reason -> throwIO (userError $ "FATAL: could not create system nodes in Zookeeper: "
+                                              ++ show reason)
 
     inits _ _ _ _ = return ()
 
@@ -202,7 +206,7 @@ server rzh config@Config{..} =
     register controller pid
     watchRegistration config
     proxy' <- spawnProxy
-    regself <- runExceptT $ create rzh (controllersNode </> pretty pid)
+    regself <- create rzh (controllersNode </> pretty pid)
                           (pidBytes pid) OpenAclUnsafe [Ephemeral]
     case regself of
         Left reason ->
@@ -243,7 +247,7 @@ server rzh config@Config{..} =
         return st{monPids = Map.delete pid monPids}
       where
         deleteNode node =
-         do result <- runExceptT $ delete rzh node Nothing
+         do result <- liftIO $ ZK.delete rzh node Nothing
             case result of
                   Left reason -> logError  $ show reason
                                           ++ " - failed to delete "
@@ -253,8 +257,7 @@ server rzh config@Config{..} =
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
         createAssert rzh (servicesNode </> name) Nothing OpenAclUnsafe []
-        result <- runExceptT $ create rzh node (pidBytes rpid)
-                         OpenAclUnsafe [Ephemeral]
+        result <- create rzh node (pidBytes rpid) OpenAclUnsafe [Ephemeral]
         case result of
             Right _ -> lift $
              do logTrace $ "Registered " ++ node
@@ -281,7 +284,7 @@ server rzh config@Config{..} =
              do sendChan reply pids
                 return st{nodeCache = Map.insert node pids nodeCache}
             Left reason ->
-             do logError $  "Retrieval failed for node: " ++ node ++ " - " ++ reason
+             do logError $  "Retrieval failed for node: " ++ node ++ " - " ++ show reason
                 sendChan reply []
                 return st{nodeCache = Map.delete node nodeCache}
 
@@ -297,12 +300,12 @@ server rzh config@Config{..} =
     pretty pid = drop 6 (show pid)
 
 handleGlobalCandidate :: Config -> State
-                      -> String -> Closure (Process ()) -> SendPort ProcessId
+                      -> String -> Closure (Process ()) -> SendPort (Either String ProcessId)
                       -> ExceptT ZKError Process State
 handleGlobalCandidate Config{..} st@State{..} name clos reply
     | Just (myid, staged) <- Map.lookup name candidates =
         case Map.lookup (globalsNode </> name) nodeCache of
-            Just (pid : _) -> lift $ sendChan reply pid >> return st
+            Just (pid : _) -> lift $ sendChan reply (Right pid) >> return st
             _              -> respondElect myid staged
     | otherwise =
          do proc <- lift $ unClosure clos
@@ -310,10 +313,15 @@ handleGlobalCandidate Config{..} st@State{..} name clos reply
             myid <- registerGlobalId staged
             respondElect myid staged
       where
-        respondElect myid staged =
-         do (pid, st') <- mayElect st name myid staged
-            lift $ sendChan reply pid
-            return st'
+        respondElect myid staged = lift $
+         do eresult <- runExceptT $ mayElect st name myid staged
+            case eresult of
+                Right (pid, st') ->
+                 do sendChan reply (Right pid)
+                    return st'
+                Left reason ->
+                 do sendChan reply (Left $ show reason)
+                    return st
 
         registerGlobalId staged =
          do let pname = globalsNode </> name
@@ -321,7 +329,7 @@ handleGlobalCandidate Config{..} st@State{..} name clos reply
             node <- create conn (pname </> "")
                                 (pidBytes staged)
                                 OpenAclUnsafe
-                                [Ephemeral, Sequence]
+                                [Ephemeral, Sequence] >>= hoistEither
             return $ extractId node
           where
             extractId s = trimId (reverse s) ""
@@ -391,25 +399,19 @@ getPid conn name watcher =
 
 getChildPids :: MonadIO m
              => Zookeeper -> String -> Maybe Watcher
-             -> m (Either String [ProcessId])
+             -> m (Either ZKError [ProcessId])
 getChildPids rzh node watcher = liftIO $
  do enodes' <- ZK.getChildren rzh node watcher
     case enodes' of
         Left NoNodeError -> return $ Right []
         _ ->
             runExceptT $
-             do children <- hoistEither (showEither enodes')
+             do children <- hoistEither enodes'
                 forM children $ \child ->
                  do eresult <- liftIO $ ZK.get rzh (node </> child) Nothing
                     case eresult of
-                       Left reason ->
-                         do let msg = "Error fetching data for " ++ (node </> child)
-                                      ++ " : " ++ show reason
-                            throwE msg
-                       Right (Nothing, _) ->
-                         do let msg = "Error fetching data for " ++ (node </> child)
-                                      ++ " : data was empty."
-                            throwE msg
+                       Left reason        -> throwE reason
+                       Right (Nothing, _) -> throwE NothingError
                        Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
 
 watchRegistration :: Config -> Process ()
@@ -445,10 +447,6 @@ waitController =
 hoistEither :: Monad m => Either e a -> ExceptT e m a
 hoistEither = ExceptT . return
 
-showEither :: Show a => Either a b -> Either String b
-showEither (Left zkerr) = Left $ show zkerr
-showEither (Right a) = Right a
-
 (</>) :: String -> String -> String
 l </> r = l ++ "/" ++ r
 
@@ -467,13 +465,11 @@ rootNode = "/distributed-process"
 createAssert :: MonadIO m
              => Zookeeper -> String -> Maybe BS.ByteString -> AclList -> [CreateFlag]
              -> ExceptT ZKError m ()
-createAssert z name d a f = assertNode (create z name d a f)
+createAssert z n d a f = create z n d a f >>= eitherExists
   where
-    assertNode ema = lift $ runExceptT ema >>= eitherExists
     eitherExists (Right _)  = return ()
     eitherExists (Left NodeExistsError) = return ()
-    eitherExists (Left _) = liftIO $
-        throwIO (userError $ "Fatal: could not create node: " ++ name)
+    eitherExists (Left reason) = throwE reason
 
 pidBytes :: ProcessId -> Maybe BS.ByteString
 pidBytes = Just . BL.toStrict . encode
@@ -504,11 +500,8 @@ spawnProxy =
     return $ \f -> putMVar action f >> takeMVar result
 
 create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
-       -> AclList -> [CreateFlag] -> ExceptT ZKError m String
-create z n d a = hoistEither <=< liftIO . ZK.create z n d a
-
-delete :: MonadIO m => Zookeeper -> String -> Maybe ZK.Version -> ExceptT ZKError m ()
-delete z n = hoistEither <=< liftIO . ZK.delete z n
+       -> AclList -> [CreateFlag] -> m (Either ZKError String)
+create z n d a = liftIO . ZK.create z n d a
 
 bootstrap
           -- ^ Hostname or IP this Cloud Haskell node will listen on.
