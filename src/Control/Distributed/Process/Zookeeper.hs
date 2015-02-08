@@ -4,21 +4,27 @@
 
 module Control.Distributed.Process.Zookeeper
    (
-     zkController
-   , zkControllerWith
-   , bootstrap
+   -- * Startup
+     bootstrap
    , bootstrapWith
+   , zkController
+   , zkControllerWith
+   -- * Basic API
    , registerZK
    , getPeers
    , getCapable
    , nsendPeers
    , nsendCapable
+   -- * Globals
    , registerCandidate
-   , waitController
+   , whereisGlobal
+   -- * Config
    , Config(..)
    , defaultConfig
+   -- * Utility
    , nolog
    , sayTrace
+   , waitController
    ) where
 
 import           Database.Zookeeper                       (AclList (..),
@@ -63,10 +69,11 @@ import Network.Transport (closeTransport)
 
 
 data Command = Register String ProcessId (SendPort (Either String ()))
-             | GlobalCandidate String (Closure (Process ())) (SendPort (Either String ProcessId))
+             | GlobalCandidate String ProcessId (SendPort (Either String ProcessId))
              | CheckCandidate String
              | ClearCache String
              | GetRegistered String (SendPort [ProcessId])
+             | GetGlobal String (SendPort (Maybe ProcessId))
              | Exit
     deriving (Show, Typeable, Generic)
 
@@ -151,7 +158,9 @@ getPeers = fmap processNodeId <$> callZK (GetRegistered controllersNode)
 -- communicated through a 'Watcher'. Data will be fetched from Zookeeper
 -- only when it is changed and then requested again.
 getCapable :: String -> Process [ProcessId]
-getCapable name = callZK (GetRegistered (servicesNode </> name))
+getCapable name =
+    callZK (GetRegistered (servicesNode </> name))
+
 
 -- | Broadcast a message to a specific service on all registered nodes.
 --
@@ -167,8 +176,19 @@ nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service m
 nsendCapable :: Serializable a => String -> a -> Process ()
 nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
-registerCandidate :: String -> Closure (Process ()) -> Process (Either String ProcessId)
-registerCandidate name clos = callZK (GlobalCandidate name clos)
+-- | Register a candidate process for election of a single process
+-- associated to the given global name, and returns the process ID of the
+-- elected global (which may or may not be on the local node). The @Process ()@ argument is
+-- only evaluated if this node ends up being the elected host for the
+-- global. Calling this function subsequently on the same node for
+-- the same name will be a no-op.
+registerCandidate :: String -> Process () -> Process (Either String ProcessId)
+registerCandidate name proc = stage >>= callZK . GlobalCandidate name
+  where stage = spawnLocal $ (expect :: Process Elect) >> proc
+
+-- | Find a registered global by name - see 'registerCandidate'.
+whereisGlobal :: String -> Process (Maybe ProcessId)
+whereisGlobal = callZK . GetGlobal
 
 -- | Run a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper using default
@@ -232,11 +252,6 @@ server rzh config@Config{..} =
           in logTrace (show st) >> receiveWait [recvCmd, recvMon]
     void $ loop (State mempty mempty mempty pid proxy' rzh)
   where
-    watchCache State{..} _ _ ZK.ConnectedState (Just node) =
-        proxy $ send spid (ClearCache node)
-
-    watchCache _ _ _ _ _ = return ()
-
     reap st@State{..} pid =
      do let (services, globals) = fromMaybe ([],[]) (Map.lookup pid monPids)
         forM_ services $ \name ->
@@ -278,7 +293,7 @@ server rzh config@Config{..} =
     handle st@State{..} (GetRegistered node reply) =
      do epids <- case Map.lookup node nodeCache of
                         Just pids -> return (Right pids)
-                        Nothing -> getChildPids rzh node (Just $ watchCache st)
+                        Nothing -> getChildPids rzh node (Just $ watchCache st node)
         lift $ case epids of
             Right pids ->
              do sendChan reply pids
@@ -290,6 +305,29 @@ server rzh config@Config{..} =
 
     handle st (GlobalCandidate n c r) = handleGlobalCandidate config st n c r
 
+    handle st@State{..} (GetGlobal name reply) =
+        let gname = globalsNode </> name in
+        case Map.lookup gname nodeCache of
+            Just (pid : _) -> lift $
+                               do sendChan reply (Just pid)
+                                  return st
+            _              -> do elected <- getElected
+                                 case elected of
+                                    Just pid ->
+                                     do lift $
+                                          sendChan reply (Just pid)
+                                        return st {nodeCache = Map.insert gname [pid] nodeCache}
+                                    Nothing -> do lift $ sendChan reply Nothing
+                                                  return st
+      where
+        getElected =
+         do children <- getGlobalIds conn name
+            case children of
+                [] -> return Nothing
+                (first: _) ->
+                    Just `fmap` getPid conn (globalsNode </> name </> first)
+                                            (Just $ watchCache st name)
+
     handle st@State{..} (CheckCandidate name) =
         case Map.lookup name candidates of
             Just (myid, staged) -> snd `fmap` mayElect st name myid staged
@@ -300,18 +338,20 @@ server rzh config@Config{..} =
     pretty pid = drop 6 (show pid)
 
 handleGlobalCandidate :: Config -> State
-                      -> String -> Closure (Process ()) -> SendPort (Either String ProcessId)
+                      -> String -> ProcessId -> SendPort (Either String ProcessId)
                       -> ExceptT ZKError Process State
-handleGlobalCandidate Config{..} st@State{..} name clos reply
+handleGlobalCandidate Config{..} st@State{..} name proc reply
     | Just (myid, staged) <- Map.lookup name candidates =
         case Map.lookup (globalsNode </> name) nodeCache of
-            Just (pid : _) -> lift $ sendChan reply (Right pid) >> return st
+            Just (pid : _) -> lift $
+                               do sendChan reply (Right pid)
+                                  exit proc "Candidate already staged."
+                                  return st
+
             _              -> respondElect myid staged
     | otherwise =
-         do proc <- lift $ unClosure clos
-            staged <- lift $ spawnLocal $ (expect :: Process Elect) >> proc
-            myid <- registerGlobalId staged
-            respondElect myid staged
+         do myid <- registerGlobalId proc
+            respondElect myid proc
       where
         respondElect myid staged = lift $
          do eresult <- runExceptT $ mayElect st name myid staged
@@ -340,13 +380,14 @@ handleGlobalCandidate Config{..} st@State{..} name clos reply
 
 mayElect :: State -> String -> String -> ProcessId -> ExceptT ZKError Process (ProcessId, State)
 mayElect st@State{..} name myid staged =
- do others <- sort `fmap` getGlobalIds conn name
+ do others <- getGlobalIds conn name
     let first : _ = others
     if myid == first
         then
          do lift $ send staged Elect
-            lift $ void $ monitor staged
-            return (staged, stCacheMon)
+            st' <- lift $ cacheNMonitor staged
+
+            return (staged, st')
         else
          do let prev = findPrev others
             watchFirst <- if prev == first then return $ Just watchPid
@@ -368,24 +409,30 @@ mayElect st@State{..} name myid staged =
 
     stCandidate = st{candidates = Map.insert name (myid, staged) candidates}
     stCache = stCandidate {nodeCache = Map.insert (globalsNode </> name) [staged] nodeCache}
-    stCacheMon =
-         let apGlobal (a', b') (a, b) = (a' ++ a, b' ++ b) in
-         st{ candidates = Map.delete name candidates
-           , monPids = Map.insertWith apGlobal
-                                      staged
-                                      ([],[name </> myid]) monPids
-           , nodeCache = Map.insert (globalsNode </> name) [staged] nodeCache
-           }
+    cacheNMonitor pid =
+     do void $ monitor pid
+        liftIO $ void $ ZK.exists conn (globalsNode </> name </> myid) (Just $ watchCache st (globalsNode </> name))
+        return stCacheMon
+      where
+        stCacheMon =
+             let apGlobal (a', b') (a, b) = (a' ++ a, b' ++ b) in
+             st{ candidates = Map.delete name candidates
+               , monPids = Map.insertWith apGlobal
+                                          pid
+                                          ([],[name </> myid]) monPids
+               , nodeCache = Map.insert (globalsNode </> name) [pid] nodeCache
+               }
 
 getGlobalIds :: MonadIO m
              => Zookeeper -> String -> ExceptT ZKError m [String]
 getGlobalIds conn name = liftIO $
  do echildren <- ZK.getChildren conn (globalsNode </> name) Nothing
     case echildren of
+        Left NoNodeError -> return []
         Left reason ->
          do putStrLn $ "Could not fetch globals for " ++ name ++ " - " ++ show reason
             return []
-        Right children -> return children
+        Right children -> return (sort children)
 
 getPid :: MonadIO m
        => Zookeeper -> String -> Maybe Watcher
@@ -413,6 +460,12 @@ getChildPids rzh node watcher = liftIO $
                        Left reason        -> throwE reason
                        Right (Nothing, _) -> throwE NothingError
                        Right (Just bs, _) -> return (decode $ BL.fromStrict bs)
+
+watchCache :: State -> String -> a -> b -> ZK.State -> c -> IO ()
+watchCache State{..} node _ _ ZK.ConnectedState _ =
+    proxy $ send spid (ClearCache node)
+
+watchCache _ _ _ _ _ _ = return ()
 
 watchRegistration :: Config -> Process ()
 watchRegistration Config{..} = do

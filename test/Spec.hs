@@ -9,7 +9,6 @@ import           Control.Concurrent.Lifted
 import           Control.Distributed.Process.MonadBaseControl()
 import           Control.Distributed.Process hiding (bracket)
 import           Control.Distributed.Process.Zookeeper
-import           Control.Distributed.Process.Closure
 import           Control.Distributed.Process.Serializable (Serializable)
 import Control.Distributed.Process.Node (initRemoteTable)
 import Control.DeepSeq (NFData)
@@ -100,12 +99,10 @@ spec = do
             it "will run a single process with a global name" $ do
                 testBoot $ do
                     pid <- getSelfPid
-                    let cu =
-                            returnCP sdictUnit ()
-                            `bindCP` cpSend sdictUnit pid
-                            `seqCP` cpExpect sdictUnit
                     let racer mv =
-                           do void $ registerCandidate "test-global" cu
+                           do void $ registerCandidate "test-global" $
+                                      do send pid ()
+                                         expect :: Process ()
                               putMVar mv ()
                               expect :: Process ()
 
@@ -115,35 +112,81 @@ spec = do
                     takeMVar two
                     -- we should only get one
                     () <- expect :: Process ()
-                    expectTimeout 100000
+                    expectTimeout 1000000
                 `shouldReturn` (Nothing :: Maybe ())
 
             it "will elect a new global when one exits" $ do
                 testBoot $ do
                     pid <- getSelfPid
-                    let cu =
-                            returnCP sdictUnit ()
-                            `bindCP` cpSend sdictUnit pid
-                            `seqCP` cpExpect sdictUnit
 
                     let racer mv =
-                           do Right gpid <- registerCandidate "test-global2" cu
+                           do Right gpid <- registerCandidate "test-global2" $
+                                              do send pid ()
+                                                 expect :: Process ()
                               putMVar mv gpid
                               expect :: Process ()
 
                     one <- forkSlave racer
                     two <- forkSlave racer
                     three <- forkSlave racer
-                    gpid <- takeMVar one
+                    first <- takeMVar one
                     void $ takeMVar two
                     void $ takeMVar three
-                    exit gpid "because"
+                    exit first "because"
+                    () <- expect :: Process ()
+                    () <- expect :: Process ()
+                    Just second <- whereisGlobal "test-global2"
                     -- make sure only ONE candidate is elected on exit of
                     -- first
-                    () <- expect :: Process ()
-                    () <- expect :: Process ()
-                    expectTimeout 100000
-                `shouldReturn` (Nothing :: Maybe ())
+                    Nothing <- expectTimeout 100000 :: Process (Maybe ())
+                    return (first /= second)
+                `shouldReturn` True
+
+            it "will not leak processes when a candidate is attempted to register again" $ do
+                testBoot $ do
+                    nodeid <- getSelfNode
+
+                    Right gpid <- registerCandidate "test-global3" $
+                                      (expect :: Process ())
+
+                    Right stats <- getNodeStats nodeid
+                    let b4 = nodeStatsProcesses stats
+
+                    Right same <- registerCandidate "test-global3" $
+                                      (expect :: Process ())
+
+                    Right stats' <- getNodeStats nodeid
+                    let after' = nodeStatsProcesses stats'
+
+                    return ((b4 + 1 == after') && (gpid == same))
+                `shouldReturn` True
+
+            it "will clear the name cache when a service exits" $ do
+                testBoot $ do
+                    parent <- getSelfPid
+                    void $ spawnLocal $
+                             do self <- getSelfPid
+                                register "test-cache" self
+                                threadDelay 10000
+                                send parent ()
+                                (expect :: Process ())
+                                send parent ()
+                    (expect :: Process ())
+                    [pid] <- getCapable "test-cache"
+                    send pid ()
+                    (expect :: Process ())
+                    threadDelay 10000
+                    getCapable "test-cache"
+                `shouldReturn` []
+
+            it "will clear the name cache when a global process exits" $ do
+                testBoot $ do
+                    Right gpid <- registerCandidate "test-cache2" $
+                                      (expect :: Process ())
+                    send gpid ()
+                    threadDelay 100000
+                    whereisGlobal "test-cache2"
+                `shouldReturn` Nothing
 
 zookeepers = "localhost:2181"
 
