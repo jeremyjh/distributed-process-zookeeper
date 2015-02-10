@@ -17,17 +17,21 @@ main =
                               initRemoteTable $
      do args <- liftIO getArgs
         case args of
-            job : _ -> -- arg job name - transient requestor - sends job and exits
+            job : _ -> -- transient requestor - sends job and exits
              do Just boss <- whereisGlobal "boss"
                 send boss job
-            _  ->     -- no args - persistent process - will be a boss or boss candidate + worker
-             do Right boss <- registerCandidate "boss" $
-                                  say "I'm the boss!" >> bossLoop 0
+            _  -> -- will be a boss or boss candidate + worker
+             do say "Starting persistent process - press <Enter> to exit."
+                Right boss <- registerCandidate "boss" $
+                                do say "I'm the boss!"
+                                   workers <- getCapable "worker"
+                                   case length workers of
+                                       0 -> say "I don't do any work! Start a worker."
+                                       n -> say $ "I've got " ++ show n ++ " workers right now."
+                                   bossLoop 0
                 self <- getSelfNode
                 if self == processNodeId boss -- like a boss
-                    then do say "I don't do any work! Start a worker."
-                            void $ liftIO getLine
-                            return ()
+                    then void $ liftIO getLine
                     else do worker <- getSelfPid
                             register "worker" worker
                             say "Worker waiting for task..."
@@ -36,13 +40,13 @@ main =
 bossLoop :: Int -> Process ()
 bossLoop i =
  do job <- expect :: Process String
-    say $ "'Delegating' task: " ++ job
     found <- getCapable "worker"
     case found of
         [] ->
          do say "Where is my workforce?!"
             bossLoop i
         workers ->
+         do say $ "'Delegating' task: " ++ job ++ " to " ++ show (pick workers)
             send (pick workers) job >> bossLoop (i + 1)
   where pick workers
           | length workers > 1 = head $ drop (mod i (length workers)) workers
