@@ -497,6 +497,13 @@ waitController =
         Nothing -> liftIO (threadDelay 10000) >> waitController
         Just _ -> return ()
 
+stopController :: Process ()
+stopController =
+ do res <- whereis controller
+    case res of
+        Nothing -> liftIO $ putStrLn "Could not find controller."
+        Just pid -> send pid Exit
+
 hoistEither :: Monad m => Either e a -> ExceptT e m a
 hoistEither = ExceptT . return
 
@@ -589,4 +596,5 @@ bootstrapWith config host port zservs rtable proc =
            do void $ spawnLocal (zkControllerWith config zservs)
               waitController
               proc
+              stopController
     release = closeTransport
