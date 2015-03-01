@@ -37,14 +37,16 @@ import qualified Database.Zookeeper                       as ZK
 
 import Control.Concurrent
        (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
-import           Control.Exception                        (throwIO, bracket)
-import Control.Monad (forM, forM_, join, void)
+import Control.Exception (bracket)
+import Control.Monad (forM, join, void)
+import Data.Foldable (forM_)
 import Control.Monad.Except (ExceptT(..), lift)
 import           Control.Monad.IO.Class                   (MonadIO)
 import           Control.Monad.Trans.Except               (runExceptT, throwE)
 import           Data.Binary                              (Binary, decode,
                                                            encode)
 import qualified Data.ByteString                          as BS
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy                     as BL
 import           Data.Map.Strict                          (Map)
 import qualified Data.Map.Strict                          as Map
@@ -110,6 +112,13 @@ data Config = Config
       -- | An operation that will be called for error logging.
       -- jdefaultConfig' uses 'say'
     , logError :: String -> Process ()
+      -- | The ACL to use for every node - see hzk documentation for
+      -- 'ZK.AclList'. Note that if your nodes do not
+      -- connect with the same identity, every node will need at least Read
+      -- permission to all nodes created by this package.
+    , acl :: ZK.AclList
+      -- | Credentials for Zookeeper, see hzk 'ZK.addAuth' for details.
+    , credentials :: Maybe (ZK.Scheme, ByteString)
     }
 
 -- | A no-op that can be used for either of the loggers in 'Config'.
@@ -125,7 +134,13 @@ sayTrace = say . ("[C.D.P.Zookeeper: TRACE] - " ++)
 -- | By default all local names are registered with zookeeper, and only
 -- error messages are logged through 'say'.
 defaultConfig :: Config
-defaultConfig = Config "" nolog (say . ("[C.D.P.Zookeeper: ERROR] - " ++))
+defaultConfig = Config {
+      registerPrefix = ""
+    , logTrace = nolog
+    , logError = say . ("[C.D.P.Zookeeper: ERROR] - " ++)
+    , acl = OpenAclUnsafe
+    , credentials = Nothing
+    }
 
 -- |Register a name and pid as a service in Zookeeper. The controller
 -- will monitor the pid and remove its child node from Zookeeper when it
@@ -202,36 +217,65 @@ zkController = zkControllerWith defaultConfig
 zkControllerWith :: Config
                  -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
                  -> Process ()
-zkControllerWith config keepers =
- do run <- spawnProxy
-    liftIO $ ZK.withZookeeper keepers 1000 (Just inits) Nothing $ \rzh ->
-        run (server rzh config)
+zkControllerWith config@Config{..} keepers =
+ do (run, serverProxy) <- spawnProxy
+    link serverProxy
+    waitInit <- liftIO newEmptyMVar
+    liftIO $ ZK.withZookeeper keepers 1000 (Just $ inits waitInit) Nothing $ \rzh ->
+     do init' <- takeMVar waitInit
+        case init' of
+            Left reason -> run $ do logError $ "Init failed: " ++ show reason
+                                    die reason
+            Right () -> run (server rzh config)
   where
-    inits rzh SessionEvent ZK.ConnectedState _ =
-      do esetup <- runExceptT $
-           do createAssert rzh rootNode Nothing OpenAclUnsafe []
-              createAssert rzh servicesNode Nothing OpenAclUnsafe []
-              createAssert rzh controllersNode Nothing OpenAclUnsafe []
-              createAssert rzh globalsNode Nothing OpenAclUnsafe []
-         case esetup of
-            Right _ -> return ()
-            Left reason -> throwIO (userError $ "FATAL: could not create system nodes in Zookeeper: "
-                                              ++ show reason)
+    inits waitInit rzh SessionEvent ZK.ConnectedState _ =
+     do esetup <- runExceptT $ eauth >> dosetup
+        case esetup of
+            Right _ -> putMVar waitInit (Right ())
+            Left reason -> putMVar waitInit (Left reason)
+        where
+          eauth = lift auth >>= hoistEither
+          auth =
+             case credentials of
+                  Nothing -> return (Right ())
+                  Just (scheme, creds) ->
+                   do waitAuth <- newEmptyMVar
+                      ZK.addAuth rzh scheme creds $ \ res ->
+                         case res of
+                             Left reason ->
+                                 let msg = "Authentication to Zookeeper failed: " ++ show reason
+                                 in putMVar waitAuth (Left msg)
+                             Right () -> putMVar waitAuth (Right ())
+                      takeMVar waitAuth
+          dosetup =
+           do esetup <- runExceptT $
+               do createAssert rzh "/" Nothing acl []
+                  createAssert rzh rootNode Nothing acl []
+                  createAssert rzh servicesNode Nothing acl []
+                  createAssert rzh controllersNode Nothing acl []
+                  createAssert rzh globalsNode Nothing acl []
+                  createAssert rzh (globalsNode </> "blarg") Nothing acl []
+              case esetup of
+                  Right _ -> return ()
+                  Left reason ->
+                      throwE $ "FATAL: could not create system nodes in Zookeeper: "
+                             ++ show reason
 
-    inits _ _ _ _ = return ()
+    inits _ _ _ _ _ = return ()
 
 server :: Zookeeper -> Config -> Process ()
 server rzh config@Config{..} =
  do pid <- getSelfPid
     register controller pid
     watchRegistration config
-    proxy' <- spawnProxy
+    (proxy', proxyPid) <- spawnProxy
+    link proxyPid
     regself <- create rzh (controllersNode </> pretty pid)
-                          (pidBytes pid) OpenAclUnsafe [Ephemeral]
+                          (pidBytes pid) acl [Ephemeral]
     case regself of
         Left reason ->
             let msg = "Could not register self with Zookeeper: " ++ show reason
-            in logError msg >> liftIO (throwIO (userError msg))
+            in logError msg >> die msg
         Right _ -> return ()
     let loop st =
           let recvCmd = match $ \command -> case command of
@@ -271,8 +315,8 @@ server rzh config@Config{..} =
 
     handle st@State{..} (Register name rpid reply) =
      do let node = servicesNode </> name </> pretty rpid
-        createAssert rzh (servicesNode </> name) Nothing OpenAclUnsafe []
-        result <- create rzh node (pidBytes rpid) OpenAclUnsafe [Ephemeral]
+        createAssert rzh (servicesNode </> name) Nothing acl []
+        result <- create rzh node (pidBytes rpid) acl [Ephemeral]
         case result of
             Right _ -> lift $
              do logTrace $ "Registered " ++ node
@@ -309,16 +353,14 @@ server rzh config@Config{..} =
         let gname = globalsNode </> name in
         case Map.lookup gname nodeCache of
             Just (pid : _) -> lift $
-                               do sendChan reply (Just pid)
-                                  return st
-            _              -> do elected <- getElected
-                                 case elected of
-                                    Just pid ->
-                                     do lift $
-                                          sendChan reply (Just pid)
-                                        return st {nodeCache = Map.insert gname [pid] nodeCache}
-                                    Nothing -> do lift $ sendChan reply Nothing
-                                                  return st
+               do sendChan reply (Just pid)
+                  return st
+            _              ->
+               do elected <- getElected
+                  lift $ sendChan reply elected
+                  return $ maybe st
+                                 (\pid -> st {nodeCache = Map.insert gname [pid] nodeCache})
+                                 elected
       where
         getElected =
          do children <- getGlobalIds conn name
@@ -365,10 +407,10 @@ handleGlobalCandidate Config{..} st@State{..} name proc reply
 
         registerGlobalId staged =
          do let pname = globalsNode </> name
-            createAssert conn pname Nothing OpenAclUnsafe []
+            createAssert conn pname Nothing acl []
             node <- create conn (pname </> "")
                                 (pidBytes staged)
-                                OpenAclUnsafe
+                                acl
                                 [Ephemeral, Sequence] >>= hoistEither
             return $ extractId node
           where
@@ -490,18 +532,22 @@ watchRegistration Config{..} = do
   where prefixed = isPrefixOf registerPrefix
 
 -- | Wait for zkController to startup and register iteself.
-waitController :: Process ()
-waitController =
+waitController :: Int -> Process (Maybe ())
+waitController timeout =
  do res <- whereis controller
     case res of
-        Nothing -> liftIO (threadDelay 10000) >> waitController
-        Just _ -> return ()
+        Nothing ->
+            do let timeleft = timeout - 10000
+               if timeleft <= 0 then return Nothing
+                  else do liftIO (threadDelay 10000)
+                          waitController timeleft
+        Just _ -> return (Just ())
 
 stopController :: Process ()
 stopController =
  do res <- whereis controller
     case res of
-        Nothing -> liftIO $ putStrLn "Could not find controller."
+        Nothing -> say "Could not find controller to stop it."
         Just pid -> send pid Exit
 
 hoistEither :: Monad m => Either e a -> ExceptT e m a
@@ -549,15 +595,15 @@ callZK command =
 
 -- | Create a process runner that communicates
 -- through an MVar - so you can call process actions from IO
-spawnProxy :: Process (Process a -> IO a)
+spawnProxy :: Process (Process a -> IO a, ProcessId)
 spawnProxy =
  do action <- liftIO newEmptyMVar
     result <- liftIO newEmptyMVar
-    void $ spawnLocal $
+    pid <- spawnLocal $
         let loop = join (liftIO $ takeMVar action)
                    >>= liftIO . putMVar result
                    >> loop in loop
-    return $ \f -> putMVar action f >> takeMVar result
+    return (\f -> putMVar action f >> takeMVar result, pid)
 
 create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
        -> AclList -> [CreateFlag] -> m (Either ZKError String)
@@ -593,8 +639,11 @@ bootstrapWith config host port zservs rtable proc =
     exec tcp =
        do node <- newLocalNode tcp rtable
           runProcess node $
-           do void $ spawnLocal (zkControllerWith config zservs)
-              waitController
-              proc
+           do zkpid <- spawnLocal $ zkControllerWith config zservs
+              link zkpid
+              found <- waitController 100000
+              case found of
+                Nothing -> die "Timeout waiting for Zookeeper controller to start."
+                Just () -> proc
               stopController
     release = closeTransport

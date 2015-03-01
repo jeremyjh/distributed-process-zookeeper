@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main (main, spec) where
 
@@ -10,13 +11,15 @@ import           Control.Distributed.Process.MonadBaseControl()
 import           Control.Distributed.Process hiding (bracket)
 import           Control.Distributed.Process.Zookeeper
 import           Control.Distributed.Process.Serializable (Serializable)
+import qualified Database.Zookeeper as ZK
 import Control.Distributed.Process.Node (initRemoteTable)
-import Control.DeepSeq (NFData)
+import Control.DeepSeq (NFData, deepseq)
 import Control.Monad.Trans.Control (MonadBaseControl)
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO)
-import Control.Exception.Enclosed (tryAnyDeep)
+import Control.Exception.Enclosed (catchAny)
 import Control.Exception.Lifted (throw)
+import Data.ByteString.Char8 (pack)
 
 main :: IO ()
 main = hspec spec
@@ -48,7 +51,7 @@ spec = do
                 `shouldReturn` True
 
             it "will only register prefixed local names if configured" $ do
-                testBootWith defaultConfig {registerPrefix = "zk:"}  $  do
+                testBootWith defaultConfig {registerPrefix = "zk:"} zookeepers  $  do
                     self <- getSelfPid
                     register "testr" self
                     register "zk:testr2" self
@@ -188,6 +191,23 @@ spec = do
                     whereisGlobal "test-cache2"
                 `shouldReturn` Nothing
 
+            describe "supports authorization" $ do
+
+                it "can setup with restricted acl" $ do
+                    testBootAuth "user:rightpassword" $ do
+                        -- we just run this for the initialization with
+                        -- the "correct" credentials and restricted ACL
+                        return ()
+                    `shouldReturn` ()
+
+                it "will fail if there is an ACL with different credentials" $ do
+                    testBootAuth "user:wrongpassword" $ do
+                        return ()
+                    `shouldThrow` linkException
+
+linkException :: ProcessLinkException -> Bool
+linkException _ = True
+
 zookeepers = "localhost:2181"
 
 forkSlave ma =
@@ -195,30 +215,37 @@ forkSlave ma =
     void $ fork $ testBoot (ma mv)
     return mv
 
-testBoot :: (MonadBaseControl IO io, MonadIO io, NFData a)
+testBoot :: (MonadBaseControl IO io, MonadIO io, Show a, NFData a)
          => Process a -> io a
-testBoot = testBootWith defaultConfig -- {logTrace = sayTrace}
+testBoot = testBootWith defaultConfig zookeepers -- {logTrace = sayTrace}
 
-testBootWith :: (MonadBaseControl IO io, MonadIO io, NFData a)
-             => Config -> Process a -> io a
-testBootWith config ma = testProcessTimeout 1000 (waitController >> ma >>= waitReturn )
+testBootAuth :: (MonadBaseControl IO io, MonadIO io, Show a, NFData a)
+             => String -> Process a -> io a
+testBootAuth creds = testBootWith defaultConfig { credentials = Just ("digest", pack creds)
+                                          , acl = ZK.CreatorAll
+                                          }
+                            (zookeepers ++ "/testauth")
+
+testBootWith :: (MonadBaseControl IO io, MonadIO io, Show a, NFData a)
+             => Config -> String -> Process a -> io a
+testBootWith config servers ma = testProcessTimeout 1000 (ma >>= waitReturn )
                                       (liftIO . bootstrapWith config
                                                               "localhost"
                                                               "0"
-                                                              zookeepers
+                                                              servers
                                                               initRemoteTable)
 
 waitReturn a = do threadDelay 100000; return a
 
-testProcessTimeout :: (NFData a, MonadBaseControl IO io)
+testProcessTimeout :: forall a io. (Show a, NFData a, MonadBaseControl IO io)
                 => Int -> Process a -> (Process () -> io ()) -> io a
 testProcessTimeout timeout ma runProc = do
     resultMV <- newEmptyMVar
-    void . fork $ runProc $ do
-        eresult <- tryAnyDeep ma
-        case eresult of
-            Right result -> putMVar resultMV result
-            Left exception -> putMVar resultMV (throw exception)
+    void . fork $
+        catchAny (runProc $
+                    do a <- ma
+                       a `deepseq` putMVar resultMV a)
+                 (\e -> putMVar resultMV (throw e))
     !result <- waitMVar resultMV
     return result
   where
@@ -236,4 +263,3 @@ texpect = do
     case gotit of
         Nothing -> error "Timed out in test expect"
         Just v -> return v
-

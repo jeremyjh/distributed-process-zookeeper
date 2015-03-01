@@ -58,7 +58,9 @@ test-suite spec
         monad-control,
         network-transport,
         network-transport-tcp,
-        transformers
+        transformers,
+        hzk,
+        bytestring
     type: exitcode-stdio-1.0
     main-is: Spec.hs
     buildable: True
