@@ -1,7 +1,6 @@
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main (main, spec) where
 
@@ -237,7 +236,7 @@ testBootWith config servers ma = testProcessTimeout 1000 (ma >>= waitReturn )
 
 waitReturn a = do threadDelay 100000; return a
 
-testProcessTimeout :: forall a io. (Show a, NFData a, MonadBaseControl IO io)
+testProcessTimeout :: (Show a, NFData a, MonadBaseControl IO io)
                 => Int -> Process a -> (Process () -> io ()) -> io a
 testProcessTimeout timeout ma runProc = do
     resultMV <- newEmptyMVar

@@ -3,7 +3,6 @@ import Control.Distributed.Process.Node (initRemoteTable)
 import Control.Distributed.Process.Zookeeper
 import Control.Monad (void)
 import System.Environment (getArgs)
-import System.Timeout (timeout)
 
 -- Run the program with "args" to request a job named "args" - run with no
 -- args to startup a boss and each worker. Entering a new-line will
@@ -17,17 +16,19 @@ main =
                               initRemoteTable $
      do args <- liftIO getArgs
         case args of
-            job : _ -> -- transient requestor - sends job and exits
+            job : more  -> -- transient requestor - sends job and exits
              do Just boss <- whereisGlobal "boss"
-                send boss job
+                send boss (job ++ " " ++ unwords more)
             _  -> -- will be a boss or boss candidate + worker
              do say "Starting persistent process - press <Enter> to exit."
                 Right boss <- registerCandidate "boss" $
                                 do say "I'm the boss!"
                                    workers <- getCapable "worker"
                                    case length workers of
-                                       0 -> say "I don't do any work! Start a worker."
-                                       n -> say $ "I've got " ++ show n ++ " workers right now."
+                                       0 -> say $ "I don't do any work! Start "
+                                                ++ " a worker."
+                                       n -> say $ "I've got " ++ show n
+                                                ++ " workers right now."
                                    bossLoop 0
                 self <- getSelfNode
                 if self == processNodeId boss -- like a boss
@@ -35,8 +36,13 @@ main =
                     else do worker <- getSelfPid
                             register "worker" worker
                             say "Worker waiting for task..."
+                            void . spawnLocal $ --wait for exit
+                                do void $ liftIO getLine
+                                   send worker "stop"
                             workLoop
 
+-- Calling getCapable for every loop is no problem because the results
+-- of this are cached until the worker node is updated in Zookeeper.
 bossLoop :: Int -> Process ()
 bossLoop i =
  do job <- expect :: Process String
@@ -54,13 +60,10 @@ bossLoop i =
 
 workLoop :: Process ()
 workLoop =
-  do mwork <- expectTimeout 100 :: Process (Maybe String)
-     case mwork of
-        Just work ->
-          do say $ "Doing task: " ++ work
-             workLoop
-        Nothing ->
-         do mquit <- liftIO $ timeout 1000 getLine
-            case mquit of
-                Nothing -> workLoop
-                Just _ -> return ()
+  do work <- expect :: Process String
+     case take 4 work of
+        "stop" ->
+            say "No more work for me!"
+        _ ->
+         do say $ "Doing task: " ++ work
+            workLoop

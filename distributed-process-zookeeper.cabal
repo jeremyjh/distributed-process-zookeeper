@@ -1,70 +1,97 @@
-name:                distributed-process-zookeeper
-version:             0.0.0.1
-synopsis:            A zookeeper back-end for Cloud Haskell. 
-description:         Provides service and node discovery for Cloud Haskell applications using
-                     a Zookeeper cluster for name registration, lookups and leader election. 
-                     Uses the hzk bindings to the Zookeeper multi-threaded C library.
-                     Objectives and features:
-                         * Compatibile with distributed-process-p2p API - can work as a drop-in
-                           replacement.
-                         * No dependencies beyond those used by distributed-process and hzk.
-                         * Automatic registration of local names (defined with 'register') by an MxAgent. 
-                         * Global singleton processes with leader election and recovery.
-homepage:            https://github.com/jeremyjh/distributed-process-zookeeper
-license:             BSD3
-license-file:        LICENSE
-author:              Jeremy Huffman
-maintainer:          jeremy@jeremyhuffman.com
-copyright:           Jeremy Huffman
-category:            Cloud Haskell
-build-type:          Simple
-cabal-version:       >=1.10
-
+name: distributed-process-zookeeper
+version: 0.0.0.1
+cabal-version: >=1.10
+build-type: Simple
+license: BSD3
+license-file: LICENSE
+copyright: Jeremy Huffman
+maintainer: jeremy@jeremyhuffman.com
+homepage: https://github.com/jeremyjh/distributed-process-zookeeper
+synopsis: A Zookeeper back-end for Cloud Haskell.
+description:
+    Provides service and node discovery for Cloud Haskell applications using
+    a Zookeeper cluster for name registration, lookups and leader election.
+    Uses the hzk bindings to the Zookeeper multi-threaded C library.
+    .
+    Objectives and features:
+    .
+    * Compatible with distributed-process-p2p API - can work as a drop-in
+    replacement.
+    .
+    * No dependencies beyond those already included by distributed-process, hzk and network-transport-tcp.
+    .
+    * Automatic registration of local names to Zookeeper.
+    .
+    * Global singleton processes with leader election and re-elections.
+category: Cloud Haskell
+author: Jeremy Huffman
+ 
 source-repository head
-  type: git
-  location: git://github.com/jeremyjh/distributed-process-zookeeper.git
-
+    type: git
+    location: git://github.com/jeremyjh/distributed-process-zookeeper.git
+ 
+flag zkexamples
+    Description:  Build example programs.
+    Default: False
+ 
 library
-  exposed-modules:     Control.Distributed.Process.Zookeeper
-  -- other-modules:       
-  -- other-extensions:    
-  build-depends:       base >=4.6 && <4.8
-                     , hzk >= 2.1.0
-                     , distributed-process
-                     , network-transport
-                     , network-transport-tcp 
-                     , binary
-                     , bytestring
-                     , containers
-                     , transformers >= 0.4
-                     , mtl
-                     , deepseq 
-                     , network
-  hs-source-dirs:      src
-  default-language:    Haskell2010
-  ghc-options:         -Wall
-
+    build-depends:
+        base >=4.6,
+        hzk >=2.1.0 && <2.2,
+        distributed-process >=0.5.3 && <0.6,
+        network-transport >=0.4.1.0 && <0.5,
+        network-transport-tcp >=0.4.1 && <0.5,
+        binary >=0.7.1.0 && <0.8,
+        bytestring >=0.10.4.0 && <0.11,
+        containers >=0.5.5.1 && <0.6,
+        transformers >=0.4.2.0 && <0.5,
+        mtl >=2.2.1 && <2.3,
+        deepseq >=1.3.0.2 && <1.4,
+        network >=2.6.0.2 && <2.7
+    exposed-modules:
+        Control.Distributed.Process.Zookeeper
+    exposed: True
+    buildable: True
+    default-language: Haskell2010
+    hs-source-dirs: src
+    ghc-options: -Wall
+ 
 test-suite spec
     build-depends:
-        base,
+        base >=4.7.0.1 && <4.8,
         distributed-process-zookeeper -any,
-        hspec >=2.0.2 && <2.1,
-        distributed-process-monad-control,
-        lifted-base,
-        enclosed-exceptions,
-        network,
-        distributed-process,
-        deepseq,
-        monad-control,
-        network-transport,
-        network-transport-tcp,
-        transformers,
-        hzk,
-        bytestring
+        hspec >=2.0.2,
+        distributed-process-monad-control -any,
+        lifted-base -any,
+        enclosed-exceptions -any,
+        network >=2.6.0.2 && <2.7,
+        distributed-process >=0.5.3 && <0.6,
+        deepseq >=1.3.0.2 && <1.4,
+        monad-control >=1.0.0.1 && <1.1,
+        network-transport >=0.4.1.0 && <0.5,
+        network-transport-tcp >=0.4.1 && <0.5,
+        transformers >=0.4.2.0 && <0.5,
+        hzk >=2.1.0 && <2.2,
+        bytestring >=0.10.4.0 && <0.11
     type: exitcode-stdio-1.0
     main-is: Spec.hs
     buildable: True
     default-language: Haskell2010
     hs-source-dirs: test
-    other-modules:
+    ghc-options: -threaded -with-rtsopts=-N
+ 
+executable boss
+    build-depends:
+        base >=4.7.0.1 && <4.8,
+        distributed-process-zookeeper -any,
+        distributed-process >=0.5.3 && <0.6
+     
+    if flag(zkexamples)
+        buildable: True
+    else
+        buildable: False
+    main-is: Boss.hs
+    buildable: True
+    default-language: Haskell2010
+    hs-source-dirs: examples
     ghc-options: -threaded -with-rtsopts=-N

@@ -110,7 +110,7 @@ data Config = Config
       -- 'defaultConfig' uses 'nolog'.
     , logTrace :: String -> Process ()
       -- | An operation that will be called for error logging.
-      -- jdefaultConfig' uses 'say'
+      -- defaultConfig uses 'say'
     , logError :: String -> Process ()
       -- | The ACL to use for every node - see hzk documentation for
       -- 'ZK.AclList'. Note that if your nodes do not
@@ -208,6 +208,8 @@ whereisGlobal = callZK . GetGlobal
 -- | Run a Zookeeper service process, and installs an MXAgent to
 -- automatically register all local names in Zookeeper using default
 -- options.
+--
+-- > zkController = zkControllerWith defaultConfig
 zkController :: String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
              -> Process ()
 zkController = zkControllerWith defaultConfig
@@ -532,6 +534,9 @@ watchRegistration Config{..} = do
   where prefixed = isPrefixOf registerPrefix
 
 -- | Wait for zkController to startup and register iteself.
+-- This is only useful if you are *not* using a 'bootstrap'
+-- function to start your node, but rather starting the node yourself
+-- and using one of the 'zkController' functions..
 waitController :: Int -> Process (Maybe ())
 waitController timeout =
  do res <- whereis controller
@@ -609,27 +614,31 @@ create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
        -> AclList -> [CreateFlag] -> m (Either ZKError String)
 create z n d a = liftIO . ZK.create z n d a
 
-bootstrap
-          -- ^ Hostname or IP this Cloud Haskell node will listen on.
-          :: HostName
-             -- ^ Port or port name this node will listen on.
-          -> ServiceName
-             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-          -> String
-          -> RemoteTable
+-- | Create a new Cloud Haskell node on the provided IP/Port; start
+-- a Zookeeper-backed controller process with a default configuration
+-- connected to the provided Zookeeper server list.
+-- Finally execute the supplied Process computation.
+--
+-- > bootstrap = bootstrapWith defaultConfig
+bootstrap :: HostName -- ^ Hostname or IP this Cloud Haskell node will listen on.
+          -> ServiceName -- ^ Port or port name this node will listen on.
+          -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+          -> RemoteTable -- ^ Cloud Haskell 'RemoteTable' to use in the new node.
           -> Process () -- ^ Process computation to run in the new node.
           -> IO ()
-bootstrap = bootstrapWith defaultConfig --{logTrace = sayTrace}
+bootstrap = bootstrapWith defaultConfig
 
+-- | Create a new Cloud Haskell node on the provided IP/Port; start
+-- a Zookeeper-backed controller process connected to the provided
+-- Zookeeper server list and finally execute the supplied Process computation.
 bootstrapWith
-          :: Config
-          -- ^ Hostname or IP this Cloud Haskell node will listen on.
-          -> HostName
-             -- ^ Port or port name this node will listen on.
-          -> ServiceName
-             -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-          -> String
-          -> RemoteTable -> Process () -> IO ()
+          :: Config -- ^ controller configuration
+          -> HostName -- ^ Hostname or IP this Cloud Haskell node will listen on.
+          -> ServiceName -- ^ Port or port name this node will listen on.
+          -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+          -> RemoteTable -- ^ Cloud Haskell 'RemoteTable' to use in the new node.
+          -> Process () -- ^ Process computation to run in the new node.
+          -> IO ()
 bootstrapWith config host port zservs rtable proc =
     bracket acquire release exec
   where

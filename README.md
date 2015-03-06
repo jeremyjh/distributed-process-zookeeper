@@ -25,17 +25,19 @@ main =
                               initRemoteTable $
      do args <- liftIO getArgs
         case args of
-            job : _ -> -- transient requestor - sends job and exits
+            job : more  -> -- transient requestor - sends job and exits
              do Just boss <- whereisGlobal "boss"
-                send boss job
+                send boss (job ++ " " ++ unwords more)
             _  -> -- will be a boss or boss candidate + worker
              do say "Starting persistent process - press <Enter> to exit."
                 Right boss <- registerCandidate "boss" $
                                 do say "I'm the boss!"
                                    workers <- getCapable "worker"
                                    case length workers of
-                                       0 -> say "I don't do any work! Start a worker."
-                                       n -> say $ "I've got " ++ show n ++ " workers right now."
+                                       0 -> say $ "I don't do any work! Start "
+                                                ++ " a worker."
+                                       n -> say $ "I've got " ++ show n
+                                                ++ " workers right now."
                                    bossLoop 0
                 self <- getSelfNode
                 if self == processNodeId boss -- like a boss
@@ -43,6 +45,9 @@ main =
                     else do worker <- getSelfPid
                             register "worker" worker
                             say "Worker waiting for task..."
+                            void . spawnLocal $ --wait for exit
+                                do void $ liftIO getLine
+                                   send worker "stop"
                             workLoop
 ```
 
@@ -53,30 +58,32 @@ On Ubuntu (tested on 14.04) you can install these dependencies, build and run th
 
 ```bash
 $ sudo apt-get install libzookeeper-mt-dev zookeeperd
-$ sudo service zookeeper start 
 $ cabal sandbox init
 $ cabal install -j distributed-process-zookeeper -fzkexamples
-$ .cabal-sandbox/bin/Boss
+$ .cabal-sandbox/bin/boss
 
 # now start some workers - open a new shell/window
 
-$ .cabal-sandbox/bin/Boss
+$ .cabal-sandbox/bin/boss
 
 # and another
 
-$ .cabal-sandbox/bin/Boss
+$ .cabal-sandbox/bin/boss
 
-# submit jobs - should see 'Delegation' message from first window and 'doing' from one of the workers
+# submit jobs - should see 'Delegation' message from first window and 'doing' 
+# from one of the workers
 
-$ .cabal-sandbox/bin/Boss foo
+$ .cabal-sandbox/bin/boss foo
 
 # jobs will be distributed between workers
 
-$ .cabal-sandbox/bin/Boss bar 
+$ .cabal-sandbox/bin/boss bar 
 
-# now stop the original Boss session by pressing <Enter> in that window - the second process should activate its boss candidate and will both 'Delegate' and 'Do' tasks
+# now stop the original Boss session by pressing <Enter> in that window - the 
+# second process should activate its boss candidate and will 
+# both 'Delegate' and 'Do' tasks
 ```
 
 ## Status
 
-Experimental. I have not yet used it with a production workload.
+Experimental. I have not yet used it with a production workload. It is intended for real work but unproven.
