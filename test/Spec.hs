@@ -71,6 +71,7 @@ spec = do
                               putMVar mv ()
                               "foundme" <- expect
                               putMVar mv ()
+                              expect :: Process ()
                     slave one
                     slave two
                     takeMVar one
@@ -114,7 +115,7 @@ spec = do
                     takeMVar two
                     -- we should only get one
                     () <- expect :: Process ()
-                    expectTimeout 1000000
+                    expectTimeout 100000
                 `shouldReturn` (Nothing :: Maybe ())
 
             it "will elect a new global when one exits" $ do

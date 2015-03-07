@@ -36,8 +36,8 @@ import           Database.Zookeeper                       (AclList (..),
 import qualified Database.Zookeeper                       as ZK
 
 import Control.Concurrent
-       (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar)
-import Control.Exception (bracket)
+       (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar, myThreadId)
+import Control.Exception (bracket, throwTo)
 import Control.Monad (forM, join, void)
 import Data.Foldable (forM_)
 import Control.Monad.Except (ExceptT(..), lift)
@@ -110,8 +110,11 @@ data Config = Config
       -- 'defaultConfig' uses 'nolog'.
     , logTrace :: String -> Process ()
       -- | An operation that will be called for error logging.
-      -- defaultConfig uses 'say'
+      -- 'defaultConfig' uses 'say'
     , logError :: String -> Process ()
+      -- | The log level for the C Zookeper library. 'defaultConfig' uses
+      -- 'ZK.ZLogWarn'.
+    , zLogLevel :: ZK.ZLogLevel
       -- | The ACL to use for every node - see hzk documentation for
       -- 'ZK.AclList'. Note that if your nodes do not
       -- connect with the same identity, every node will need at least Read
@@ -133,11 +136,21 @@ sayTrace = say . ("[C.D.P.Zookeeper: TRACE] - " ++)
 
 -- | By default all local names are registered with zookeeper, and only
 -- error messages are logged through 'say'.
+--
+-- > defaultConfig = Config {
+-- >       registerPrefix = ""
+-- >     , logTrace = nolog
+-- >     , logError = say . ("[C.D.P.Zookeeper: ERROR] - " ++)
+-- >     , zLogLevel = ZK.ZLogWarn
+-- >     , acl = OpenAclUnsafe
+-- >     , credentials = Nothing
+-- >     }
 defaultConfig :: Config
 defaultConfig = Config {
       registerPrefix = ""
     , logTrace = nolog
     , logError = say . ("[C.D.P.Zookeeper: ERROR] - " ++)
+    , zLogLevel = ZK.ZLogWarn
     , acl = OpenAclUnsafe
     , credentials = Nothing
     }
@@ -220,17 +233,18 @@ zkControllerWith :: Config
                  -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
                  -> Process ()
 zkControllerWith config@Config{..} keepers =
- do (run, serverProxy) <- spawnProxy
-    link serverProxy
+ do run <- spawnLinkedProxy
     waitInit <- liftIO newEmptyMVar
-    liftIO $ ZK.withZookeeper keepers 1000 (Just $ inits waitInit) Nothing $ \rzh ->
+    liftIO $ ZK.setDebugLevel zLogLevel
+    mthread <- liftIO myThreadId
+    liftIO $ ZK.withZookeeper keepers 1000 (Just $ inits mthread waitInit) Nothing $ \rzh ->
      do init' <- takeMVar waitInit
         case init' of
             Left reason -> run $ do logError $ "Init failed: " ++ show reason
                                     die reason
-            Right () -> run (server rzh config)
+            Right ()    -> run (server rzh config)
   where
-    inits waitInit rzh SessionEvent ZK.ConnectedState _ =
+    inits _ waitInit rzh SessionEvent ZK.ConnectedState _ =
      do esetup <- runExceptT $ eauth >> dosetup
         case esetup of
             Right _ -> putMVar waitInit (Right ())
@@ -263,15 +277,18 @@ zkControllerWith config@Config{..} keepers =
                       throwE $ "FATAL: could not create system nodes in Zookeeper: "
                              ++ show reason
 
-    inits _ _ _ _ _ = return ()
+    inits zkthread _ _ SessionEvent ZK.ExpiredSessionState _ =
+        --for some reason having a linked proxy die here was not getting it done
+        throwTo zkthread $ userError "Zookeeper session expired."
+
+    inits _ _ _ _ _ _ = return ()
 
 server :: Zookeeper -> Config -> Process ()
 server rzh config@Config{..} =
  do pid <- getSelfPid
     register controller pid
     watchRegistration config
-    (proxy', proxyPid) <- spawnProxy
-    link proxyPid
+    proxy' <- spawnLinkedProxy
     regself <- create rzh (controllersNode </> pretty pid)
                           (pidBytes pid) acl [Ephemeral]
     case regself of
@@ -514,11 +531,11 @@ watchCache _ _ _ _ _ _ = return ()
 watchRegistration :: Config -> Process ()
 watchRegistration Config{..} = do
     let initState = [] :: [MxEvent]
-    void $ mxAgent (MxAgentId "zookeeper-name-listener") initState [
+    void $ mxAgent (MxAgentId "zookeeper:name:listener") initState [
         mxSink $ \ev -> do
            let act =
                  case ev of
-                   (MxRegistered _ "zookeeper-name-listener") -> return ()
+                   (MxRegistered _ "zookeeper:name:listener") -> return ()
                    (MxRegistered pid name')
                         | prefixed name' -> liftMX $
                                 do ereg <- registerZK name' pid
@@ -600,15 +617,20 @@ callZK command =
 
 -- | Create a process runner that communicates
 -- through an MVar - so you can call process actions from IO
-spawnProxy :: Process (Process a -> IO a, ProcessId)
-spawnProxy =
+--
+-- This is linked bidirectionally - if either the proxy or parent exits the
+-- other will as well.
+spawnLinkedProxy :: Process (Process a -> IO a)
+spawnLinkedProxy =
  do action <- liftIO newEmptyMVar
     result <- liftIO newEmptyMVar
+    self <- getSelfPid
     pid <- spawnLocal $
         let loop = join (liftIO $ takeMVar action)
                    >>= liftIO . putMVar result
-                   >> loop in loop
-    return (\f -> putMVar action f >> takeMVar result, pid)
+                   >> loop in link self >> loop
+    link pid
+    return (\f -> putMVar action f >> takeMVar result)
 
 create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
        -> AclList -> [CreateFlag] -> m (Either ZKError String)
