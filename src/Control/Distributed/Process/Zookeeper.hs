@@ -29,45 +29,48 @@ module Control.Distributed.Process.Zookeeper
 
 import           Database.Zookeeper                       (AclList (..),
                                                            CreateFlag (..),
-                                                           Event (..),
+                                                           Event (..), Watcher,
                                                            ZKError (..),
-                                                           Zookeeper,
-                                                           Watcher)
+                                                           Zookeeper)
 import qualified Database.Zookeeper                       as ZK
 
-import Control.Concurrent
-       (threadDelay, newEmptyMVar, putMVar, takeMVar, putMVar, takeMVar, myThreadId)
-import Control.Exception (bracket, throwTo)
-import Control.Monad (forM, join, void)
-import Data.Foldable (forM_)
-import Control.Monad.Except (ExceptT(..), lift)
+import           Control.Applicative                      ((<$>))
+import           Control.Concurrent                       (myThreadId,
+                                                           newEmptyMVar,
+                                                           putMVar, putMVar,
+                                                           takeMVar, takeMVar,
+                                                           threadDelay)
+import           Control.DeepSeq                          (deepseq)
+import           Control.Exception                        (bracket, throwTo)
+import           Control.Monad                            (forM, join, void)
+import           Control.Monad.Except                     (ExceptT (..), lift)
 import           Control.Monad.IO.Class                   (MonadIO)
 import           Control.Monad.Trans.Except               (runExceptT, throwE)
 import           Data.Binary                              (Binary, decode,
                                                            encode)
+import           Data.ByteString                          (ByteString)
 import qualified Data.ByteString                          as BS
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy                     as BL
+import           Data.Foldable                            (forM_)
+import           Data.List                                (isPrefixOf, sort)
 import           Data.Map.Strict                          (Map)
 import qualified Data.Map.Strict                          as Map
 import           Data.Maybe                               (fromMaybe)
 import           Data.Monoid                              (mempty)
 import           Data.Typeable                            (Typeable)
-import Data.List (isPrefixOf, sort)
 import           GHC.Generics                             (Generic)
-import Control.Applicative ((<$>))
-import Control.DeepSeq (deepseq)
 
-import           Control.Distributed.Process              hiding (proxy, bracket)
+import           Control.Distributed.Process              hiding (bracket,
+                                                           proxy)
 import           Control.Distributed.Process.Management
+import           Control.Distributed.Process.Node         (newLocalNode,
+                                                           runProcess)
 import           Control.Distributed.Process.Serializable
-import Control.Distributed.Process.Node
-       (newLocalNode, runProcess)
-import Network (HostName)
-import Network.Socket (ServiceName)
-import Network.Transport.TCP
-       (createTransport, defaultTCPParameters)
-import Network.Transport (closeTransport)
+import           Network                                  (HostName)
+import           Network.Socket                           (ServiceName)
+import           Network.Transport                        (closeTransport)
+import           Network.Transport.TCP                    (createTransport,
+                                                           defaultTCPParameters)
 
 
 data Command = Register String ProcessId (SendPort (Either String ()))
@@ -86,13 +89,13 @@ instance Binary Elect
 
 data State = State
     {
-      nodeCache :: Map String [ProcessId]
+      nodeCache  :: Map String [ProcessId]
     -- service nodes to remove each pid from when it exits
-    , monPids :: Map ProcessId ([String],[String])
+    , monPids    :: Map ProcessId ([String],[String])
     , candidates :: Map String (String, ProcessId)
-    , spid :: ProcessId
-    , proxy :: Process () -> IO ()
-    , conn :: Zookeeper
+    , spid       :: ProcessId
+    , proxy      :: Process () -> IO ()
+    , conn       :: Zookeeper
     }
 
 
@@ -108,20 +111,20 @@ data Config = Config
       registerPrefix :: String
       -- | An operation that will be called for trace level logging.
       -- 'defaultConfig' uses 'nolog'.
-    , logTrace :: String -> Process ()
+    , logTrace       :: String -> Process ()
       -- | An operation that will be called for error logging.
       -- 'defaultConfig' uses 'say'
-    , logError :: String -> Process ()
+    , logError       :: String -> Process ()
       -- | The log level for the C Zookeper library. 'defaultConfig' uses
       -- 'ZK.ZLogWarn'.
-    , zLogLevel :: ZK.ZLogLevel
+    , zLogLevel      :: ZK.ZLogLevel
       -- | The ACL to use for every node - see hzk documentation for
       -- 'ZK.AclList'. Note that if your nodes do not
       -- connect with the same identity, every node will need at least Read
       -- permission to all nodes created by this package.
-    , acl :: ZK.AclList
+    , acl            :: ZK.AclList
       -- | Credentials for Zookeeper, see hzk 'ZK.addAuth' for details.
-    , credentials :: Maybe (ZK.Scheme, ByteString)
+    , credentials    :: Maybe (ZK.Scheme, ByteString)
     }
 
 -- | A no-op that can be used for either of the loggers in 'Config'.
@@ -386,12 +389,12 @@ server rzh config@Config{..} =
             case children of
                 [] -> return Nothing
                 (first: _) ->
-                    Just `fmap` getPid conn (globalsNode </> name </> first)
-                                            (Just $ watchCache st name)
+                    Just <$> getPid conn (globalsNode </> name </> first)
+                                         (Just $ watchCache st name)
 
     handle st@State{..} (CheckCandidate name) =
         case Map.lookup name candidates of
-            Just (myid, staged) -> snd `fmap` mayElect st name myid staged
+            Just (myid, staged) -> snd <$> mayElect st name myid staged
             Nothing             -> return st
 
     handle st Exit = return st --satisfy exhaustiveness checker

@@ -8,7 +8,7 @@ This Zookeeper back-end can bring a few advantages:
 *  Service data is cached locally (cache is cleared with Zookeeper watches) - multiple queries for the same service name are served from cache, unless processes advertising that service have been added or removed (cache is swept when Zookeeper watches fire.) 
 *  Globally unique processes can be established via leader election.
 
-The trade-off is effort to manage the Zookeeper cluster. One server is fine for development or casual deployments but for production you really need a cluster of three servers. 
+The trade-off is effort to manage the Zookeeper cluster. One server is fine for development or casual deployments but for production you really need a minimum of three servers. 
 
 
 ## Global Processes via Leader Election
