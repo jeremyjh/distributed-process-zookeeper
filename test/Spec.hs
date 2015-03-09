@@ -44,7 +44,7 @@ spec = do
                 testBoot $  do
                     self <- getSelfPid
                     register "testy" self
-                    threadDelay 10000
+                    threadDelay 20000
                     [found] <- getCapable "testy"
                     return (found == self)
                 `shouldReturn` True
@@ -171,11 +171,9 @@ spec = do
                              do self <- getSelfPid
                                 register "test-cache" self
                                 threadDelay 10000
-                                send parent ()
                                 (expect :: Process ())
                                 send parent ()
-                    (expect :: Process ())
-                    [pid] <- getCapable "test-cache"
+                    pid <- waitZKRegistration "test-cache"
                     send pid ()
                     (expect :: Process ())
                     threadDelay 10000
@@ -255,7 +253,7 @@ testProcessTimeout timeout ma runProc = do
                   tryTakeMVar mv >>= maybe (delay >> loop (lapsed + 1))
                                            return
               | otherwise = error "Execution of Process test timed-out."
-            delay = threadDelay 1000
+            delay = threadDelay 2000
 
 texpect :: Serializable a => Process a
 texpect = do
@@ -263,3 +261,9 @@ texpect = do
     case gotit of
         Nothing -> error "Timed out in test expect"
         Just v -> return v
+
+waitZKRegistration name = loop
+  where loop = do found <- getCapable name
+                  case found of
+                    []       -> threadDelay 1000 >> loop
+                    pid : _ -> return pid
