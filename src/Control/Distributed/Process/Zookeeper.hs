@@ -212,8 +212,8 @@ nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 -- associated to the given global name, and returns the process ID of the
 -- elected global (which may or may not be on the local node). The @Process ()@ argument is
 -- only evaluated if this node ends up being the elected host for the
--- global. Calling this function subsequently on the same node for
--- the same name will be a no-op.
+-- global. Calling this function subsequently on the same node for the same
+-- name will replace the current candidate computation with the new one.
 registerCandidate :: String -> Process () -> Process (Either String ProcessId)
 registerCandidate name proc = stage >>= callZK . GlobalCandidate name
   where stage = spawnLocal $ (expect :: Process Elect) >> proc
@@ -407,22 +407,23 @@ handleGlobalCandidate :: Config -> State
                       -> ExceptT ZKError Process State
 handleGlobalCandidate Config{..} st@State{..} name proc reply
     | Just (myid, staged) <- Map.lookup name candidates =
-        case Map.lookup (globalsNode </> name) nodeCache of
-            Just (pid : _) -> lift $
-                               do sendChan reply (Right pid)
-                                  exit proc "Candidate already staged."
-                                  return st
+          case Map.lookup (globalsNode </> name) nodeCache of
+              Just (pid : _) -> lift $
+                                 do exit staged "New candidate staged."
+                                    sendChan reply (Right pid)
+                                    return st {candidates = Map.insert name (myid, proc) candidates}
 
-            _              -> respondElect myid staged
+              _              -> respondElect myid proc (Just staged)
     | otherwise =
          do myid <- registerGlobalId proc
-            respondElect myid proc
+            respondElect myid proc Nothing
       where
-        respondElect myid staged = lift $
+        respondElect myid staged mprev = lift $
          do eresult <- runExceptT $ mayElect st name myid staged
             case eresult of
                 Right (pid, st') ->
                  do sendChan reply (Right pid)
+                    forM_ mprev (`exit` "New candidate staged.")
                     return st'
                 Left reason ->
                  do sendChan reply (Left $ show reason)
@@ -451,7 +452,6 @@ mayElect st@State{..} name myid staged =
         then
          do lift $ send staged Elect
             st' <- lift $ cacheNMonitor staged
-
             return (staged, st')
         else
          do let prev = findPrev others
