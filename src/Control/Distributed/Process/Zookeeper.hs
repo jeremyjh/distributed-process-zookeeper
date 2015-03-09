@@ -41,7 +41,8 @@ import           Control.Concurrent                       (myThreadId,
                                                            takeMVar, takeMVar,
                                                            threadDelay)
 import           Control.DeepSeq                          (deepseq)
-import           Control.Exception                        (bracket, throwTo)
+import           Control.Exception                        (bracket, throwIO,
+                                                           throwTo)
 import           Control.Monad                            (forM, join, void)
 import           Control.Monad.Except                     (ExceptT (..), lift)
 import           Control.Monad.IO.Class                   (MonadIO)
@@ -657,20 +658,21 @@ bootstrap = bootstrapWith defaultConfig
 -- | Create a new Cloud Haskell node on the provided IP/Port; start
 -- a Zookeeper-backed controller process connected to the provided
 -- Zookeeper server list and finally execute the supplied Process computation.
-bootstrapWith
-          :: Config -- ^ controller configuration
-          -> HostName -- ^ Hostname or IP this Cloud Haskell node will listen on.
-          -> ServiceName -- ^ Port or port name this node will listen on.
-          -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
-          -> RemoteTable -- ^ Cloud Haskell 'RemoteTable' to use in the new node.
-          -> Process () -- ^ Process computation to run in the new node.
-          -> IO ()
+bootstrapWith :: Config -- ^ controller configuration
+              -> HostName -- ^ Hostname or IP this Cloud Haskell node will listen on.
+              -> ServiceName -- ^ Port or port name this node will listen on.
+              -> String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
+              -> RemoteTable -- ^ Cloud Haskell 'RemoteTable' to use in the new node.
+              -> Process () -- ^ Process computation to run in the new node.
+              -> IO ()
 bootstrapWith config host port zservs rtable proc =
     bracket acquire release exec
   where
     acquire =
-     do Right tcp <- createTransport host port defaultTCPParameters
-        return tcp
+     do mtcp <- createTransport host port defaultTCPParameters
+        case mtcp of
+            Right tcp   -> return tcp
+            Left reason -> throwIO reason
     exec tcp =
        do node <- newLocalNode tcp rtable
           runProcess node $
