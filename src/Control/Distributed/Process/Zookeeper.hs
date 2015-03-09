@@ -162,23 +162,24 @@ defaultConfig = Config {
 -- will monitor the pid and remove its child node from Zookeeper when it
 -- exits.
 --
--- Names will be registered at "/distributed-process/services/<name>/<pid>"
+-- Names will be registered at "\/distributed-process\/services\/\<name\>\/\<pid\>"
 --
 -- Note: By default all locally registered names (using 'register') will be
 -- registered in Zookeeper under the same name by an MxAgent process. Use
--- this function if you want to register an anonymous pid or using
--- a different name - or if you are using a prefix to exclude the automatic
+-- this function if you want to register an anonymous pid or use
+-- a different name than is registered with the local Process, or when
+-- you are using a prefix to exclude the automatic
 -- registration (see 'Config').
 registerZK :: String -> ProcessId -> Process (Either String ())
 registerZK name rpid = callZK $ Register name rpid
 
 -- | Get a list of nodes advertised in Zookeeper. These are registered
 -- when 'zkController' starts in path
--- "/distributed-process/controllers/<pid>".
+-- "\/distributed-process\/controllers\/\<pid\>".
 --
 -- Note: this is included for API compatibility with P2P but its usage
 -- would suggest discovery patterns that could be made more efficient
--- when using Zookeeper - e.g. just use (automatic) advertisement and getCapable.
+-- when using Zookeeper - i.e. just use 'getCapable'.
 getPeers :: Process [NodeId]
 getPeers = fmap processNodeId <$> callZK (GetRegistered controllersNode)
 
@@ -197,7 +198,7 @@ getCapable name =
 --
 -- Note: this is included for API compatibility with P2P but its usage
 -- would suggest discovery patterns that could be made more efficient
--- when using Zookeeper - e.g. just use getCapable to
+-- when using Zookeeper - i.e. just use 'sendCapable' to
 -- send a broadcast directly to the registered process on each node.
 nsendPeers :: Serializable a => String -> a -> Process ()
 nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service msg)
