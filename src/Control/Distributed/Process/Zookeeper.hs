@@ -2,22 +2,37 @@
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE RecordWildCards    #-}
 
+-- | Provides service and node discovery for Cloud Haskell applications using
+--   a Zookeeper cluster for name registration, lookups and leader election.
+--   Uses the hzk bindings to the Zookeeper multi-threaded C library.
+--
+--   Objectives and features:
+--
+--   * Compatible with @distributed-process-p2p@ API - can work as a drop-in
+--   replacement.
+--
+--   * No dependencies beyond those already included by distributed-process, hzk and network-transport-tcp.
+--
+--   * Automatic registration of local names to Zookeeper.
+--
+--   * Global singleton processes with leader election and re-elections on
+--   leader exit.
 module Control.Distributed.Process.Zookeeper
    (
-   -- * Startup
+   -- * Initialization
      bootstrap
    , bootstrapWith
    , zkController
    , zkControllerWith
-   -- * Basic API
+   -- * API
    , registerZK
-   , getPeers
    , getCapable
-   , nsendPeers
    , nsendCapable
-   -- * Globals
    , registerCandidate
    , whereisGlobal
+   -- * Compatibility
+   , getPeers
+   , nsendPeers
    -- * Config
    , Config(..)
    , defaultConfig
@@ -114,7 +129,7 @@ data Config = Config
       -- 'defaultConfig' uses 'nolog'.
     , logTrace       :: String -> Process ()
       -- | An operation that will be called for error logging.
-      -- 'defaultConfig' uses 'say'
+      -- 'defaultConfig' uses 'say'.
     , logError       :: String -> Process ()
       -- | The log level for the C Zookeper library. 'defaultConfig' uses
       -- 'ZK.ZLogWarn'.
@@ -169,7 +184,7 @@ defaultConfig = Config {
 -- registered in Zookeeper under the same name by an MxAgent process. Use
 -- this function if you want to register an anonymous pid or use
 -- a different name than is registered with the local Process, or when
--- you are using a prefix to exclude the automatic
+-- you are using a 'registerPrefix' to exclude the automatic
 -- registration (see 'Config').
 registerZK :: String -> ProcessId -> Process (Either String ())
 registerZK name rpid = callZK $ Register name rpid
@@ -178,7 +193,8 @@ registerZK name rpid = callZK $ Register name rpid
 -- when 'zkController' starts in path
 -- "\/distributed-process\/controllers\/\<pid\>".
 --
--- Note: this is included for API compatibility with P2P but its usage
+-- Note: this is included for API compatibility with
+-- @distributed-process-p2p@ but its usage
 -- would suggest discovery patterns that could be made more efficient
 -- when using Zookeeper - i.e. just use 'getCapable'.
 getPeers :: Process [NodeId]
@@ -197,20 +213,20 @@ getCapable name =
 
 -- | Broadcast a message to a specific service on all registered nodes.
 --
--- Note: this is included for API compatibility with P2P but its usage
+-- Note: this is included for API compatibility with @distributed-process-p2p@ but its usage
 -- would suggest discovery patterns that could be made more efficient
 -- when using Zookeeper - i.e. just use 'sendCapable' to
 -- send a broadcast directly to the registered process on each node.
 nsendPeers :: Serializable a => String -> a -> Process ()
 nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service msg)
 
--- | Broadcast a message to a all pids registered with a particular service
+-- | Broadcast a message to all pids registered with a particular service
 -- name.
 nsendCapable :: Serializable a => String -> a -> Process ()
 nsendCapable service msg = getCapable service >>= mapM_ (`send` msg)
 
 -- | Register a candidate process for election of a single process
--- associated to the given global name, and returns the process ID of the
+-- associated to the given global name, and returns the 'ProcessId' of the
 -- elected global (which may or may not be on the local node). The @Process ()@ argument is
 -- only evaluated if this node ends up being the elected host for the
 -- global. Calling this function subsequently on the same node for the same
@@ -224,8 +240,8 @@ whereisGlobal :: String -> Process (Maybe ProcessId)
 whereisGlobal = callZK . GetGlobal
 
 -- | Run a Zookeeper service process, and installs an MXAgent to
--- automatically register all local names in Zookeeper using default
--- options.
+-- automatically register all local names in Zookeeper using
+-- 'defaultConfig'.
 --
 -- > zkController = zkControllerWith defaultConfig
 zkController :: String -- ^ The Zookeeper endpoint(s) -- comma separated list of host:port
@@ -641,8 +657,8 @@ create :: MonadIO m => Zookeeper -> String -> Maybe BS.ByteString
        -> AclList -> [CreateFlag] -> m (Either ZKError String)
 create z n d a = liftIO . ZK.create z n d a
 
--- | Create a new Cloud Haskell node on the provided IP/Port; start
--- a Zookeeper-backed controller process with a default configuration
+-- | Create a new Cloud Haskell node on the provided IP/Port and start
+-- a Zookeeper-backed controller process ('zkController') with a default configuration
 -- connected to the provided Zookeeper server list.
 -- Finally execute the supplied Process computation.
 --
@@ -655,8 +671,8 @@ bootstrap :: HostName -- ^ Hostname or IP this Cloud Haskell node will listen on
           -> IO ()
 bootstrap = bootstrapWith defaultConfig
 
--- | Create a new Cloud Haskell node on the provided IP/Port; start
--- a Zookeeper-backed controller process connected to the provided
+-- | Create a new Cloud Haskell node on the provided IP/Port and start
+-- a Zookeeper-backed controller process ('zkController') connected to the provided
 -- Zookeeper server list and finally execute the supplied Process computation.
 bootstrapWith :: Config -- ^ controller configuration
               -> HostName -- ^ Hostname or IP this Cloud Haskell node will listen on.
@@ -666,9 +682,9 @@ bootstrapWith :: Config -- ^ controller configuration
               -> Process () -- ^ Process computation to run in the new node.
               -> IO ()
 bootstrapWith config host port zservs rtable proc =
-    bracket acquire release exec
+    bracket openTransport closeTransport exec
   where
-    acquire =
+    openTransport =
      do mtcp <- createTransport host port defaultTCPParameters
         case mtcp of
             Right tcp   -> return tcp
@@ -683,4 +699,3 @@ bootstrapWith config host port zservs rtable proc =
                 Nothing -> die "Timeout waiting for Zookeeper controller to start."
                 Just () -> proc
               stopController
-    release = closeTransport

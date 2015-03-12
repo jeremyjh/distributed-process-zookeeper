@@ -22,7 +22,7 @@ description:
     .
     * Automatic registration of local names to Zookeeper.
     .
-    * Global singleton processes with leader election and re-elections.
+    * Global singleton processes with leader election and re-elections on leader exit.
 category: Cloud Haskell
 author: Jeremy Huffman
  
