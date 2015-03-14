@@ -1,5 +1,5 @@
 name: distributed-process-zookeeper
-version: 0.1.0.0
+version: 0.2.0.0
 cabal-version: >=1.10
 build-type: Simple
 license: BSD3
@@ -15,7 +15,7 @@ description:
     .
     Objectives and features:
     .
-    * Compatible with distributed-process-p2p API - can work as a drop-in
+    * Compatible with <http://hackage.haskell.org/package/distributed-process-p2p distributed-process-p2p> API - can work as a drop-in
     replacement.
     .
     * No dependencies beyond those already included by distributed-process, hzk and network-transport-tcp.
@@ -23,7 +23,11 @@ description:
     * Automatic registration of local names to Zookeeper.
     .
     * Global singleton processes with leader election and re-elections on leader exit.
-category: Cloud Haskell
+    .
+    .
+    Check out the <https://github.com/jeremyjh/distributed-process-zookeeper/blob/master/examples/Boss.hs example>.
+
+category: Control, Cloud Haskell
 author: Jeremy Huffman
  
 source-repository head
@@ -36,7 +40,7 @@ flag zkexamples
  
 library
     build-depends:
-        base >=4.6,
+        base >=4.6 && < 4.8,
         hzk >=2.1.0 && <2.2,
         distributed-process >=0.5.3 && <0.6,
         network-transport >=0.4.1.0 && <0.5,
@@ -95,4 +99,3 @@ test-suite spec
     default-language: Haskell2010
     hs-source-dirs: test
     ghc-options: -threaded -with-rtsopts=-N
- 
