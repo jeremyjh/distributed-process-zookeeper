@@ -189,6 +189,16 @@ spec = do
                     whereisGlobal "test-cache2"
                 `shouldReturn` Nothing
 
+            it "will strictly evaluate command arguments in the client process" $ do
+                testBoot $ do
+                    result <- getSelfPid >>= registerZK (error "asplode")
+                    return result
+                    -- if the Name field of the Register constructor were
+                    -- not strict, we'd get a ProcessLinkException here
+                    -- because it would be evaluated in the Controller
+                    -- process
+                `shouldThrow` anyErrorCall
+
             describe "supports authorization" $ do
 
                 it "can setup with restricted acl" $ do

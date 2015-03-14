@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE RecordWildCards    #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | Provides service and node discovery for Cloud Haskell applications using
 --   a Zookeeper cluster for name registration, lookups and leader election.
@@ -55,7 +56,7 @@ import           Control.Concurrent                       (myThreadId,
                                                            putMVar, putMVar,
                                                            takeMVar, takeMVar,
                                                            threadDelay)
-import           Control.DeepSeq                          (deepseq)
+import Control.DeepSeq (deepseq, NFData(..))
 import           Control.Exception                        (bracket, throwIO,
                                                            throwTo)
 import           Control.Monad                            (forM, join, void)
@@ -89,19 +90,22 @@ import           Network.Transport.TCP                    (createTransport,
                                                            defaultTCPParameters)
 
 
-data Command = Register String ProcessId (SendPort (Either String ()))
-             | GlobalCandidate String ProcessId (SendPort (Either String ProcessId))
-             | CheckCandidate String
-             | ClearCache String
-             | GetRegistered String (SendPort [ProcessId])
-             | GetGlobal String (SendPort (Maybe ProcessId))
+data Command = Register !String !ProcessId !(SendPort (Either String ()))
+             | GlobalCandidate !String !ProcessId !(SendPort (Either String ProcessId))
+             | CheckCandidate !String
+             | ClearCache !String
+             | GetRegistered !String !(SendPort [ProcessId])
+             | GetGlobal !String !(SendPort (Maybe ProcessId))
              | Exit
     deriving (Show, Typeable, Generic)
 
 instance Binary Command
+instance NFData Command
 
 data Elect = Elect deriving (Typeable, Generic)
+
 instance Binary Elect
+instance NFData Elect
 
 data State = State
     {
@@ -210,13 +214,12 @@ getCapable :: String -> Process [ProcessId]
 getCapable name =
     callZK (GetRegistered (servicesNode </> name))
 
-
 -- | Broadcast a message to a specific service on all registered nodes.
 --
 -- Note: this is included for API compatibility with @distributed-process-p2p@ but its usage
 -- would suggest discovery patterns that could be made more efficient
--- when using Zookeeper - i.e. just use 'sendCapable' to
--- send a broadcast directly to the registered process on each node.
+-- when using Zookeeper - i.e. just use 'nfSendCapable' to
+-- nfSend a broadcast directly to the registered process on each node.
 nsendPeers :: Serializable a => String -> a -> Process ()
 nsendPeers service msg = getPeers >>= mapM_ (\peer -> nsendRemote peer service msg)
 
@@ -360,13 +363,13 @@ server rzh config@Config{..} =
         case result of
             Right _ -> lift $
              do logTrace $ "Registered " ++ node
-                sendChan reply (Right ())
+                nfSendChan reply (Right ())
                 void $ monitor rpid
                 let apService (a',b') (a, b) = (a' ++ a, b' ++ b)
                 return st{monPids = Map.insertWith apService rpid ([name],[]) monPids}
             Left reason -> lift $
              do logError $ "Failed to register name: " ++ node ++ " - " ++ show reason
-                sendChan reply (Left $ show reason)
+                nfSendChan reply (Left $ show reason)
                 return st
 
 
@@ -380,11 +383,11 @@ server rzh config@Config{..} =
                         Nothing -> getChildPids rzh node (Just $ watchCache st node)
         lift $ case epids of
             Right pids ->
-             do sendChan reply pids
+             do nfSendChan reply pids
                 return st{nodeCache = Map.insert node pids nodeCache}
             Left reason ->
              do logError $  "Retrieval failed for node: " ++ node ++ " - " ++ show reason
-                sendChan reply []
+                nfSendChan reply []
                 return st{nodeCache = Map.delete node nodeCache}
 
     handle st (GlobalCandidate n c r) = handleGlobalCandidate config st n c r
@@ -393,11 +396,11 @@ server rzh config@Config{..} =
         let gname = globalsNode </> name in
         case Map.lookup gname nodeCache of
             Just (pid : _) -> lift $
-               do sendChan reply (Just pid)
+               do nfSendChan reply (Just pid)
                   return st
             _              ->
                do elected <- getElected
-                  lift $ sendChan reply elected
+                  lift $ nfSendChan reply elected
                   return $ maybe st
                                  (\pid -> st {nodeCache = Map.insert gname [pid] nodeCache})
                                  elected
@@ -427,7 +430,7 @@ handleGlobalCandidate Config{..} st@State{..} name proc reply
           case Map.lookup (globalsNode </> name) nodeCache of
               Just (pid : _) -> lift $
                                  do exit staged "New candidate staged."
-                                    sendChan reply (Right pid)
+                                    nfSendChan reply (Right pid)
                                     return st {candidates = Map.insert name (myid, proc) candidates}
 
               _              -> respondElect myid proc (Just staged)
@@ -439,11 +442,11 @@ handleGlobalCandidate Config{..} st@State{..} name proc reply
          do eresult <- runExceptT $ mayElect st name myid staged
             case eresult of
                 Right (pid, st') ->
-                 do sendChan reply (Right pid)
+                 do nfSendChan reply (Right pid)
                     forM_ mprev (`exit` "New candidate staged.")
                     return st'
                 Left reason ->
-                 do sendChan reply (Left $ show reason)
+                 do nfSendChan reply (Left $ show reason)
                     return st
 
         registerGlobalId staged =
@@ -467,7 +470,7 @@ mayElect st@State{..} name myid staged =
     let first : _ = others
     if myid == first
         then
-         do lift $ send staged Elect
+         do lift $ nfSend staged Elect
             st' <- lift $ cacheNMonitor staged
             return (staged, st')
         else
@@ -486,7 +489,7 @@ mayElect st@State{..} name myid staged =
                                        else findPrev (next : rest)
     findPrev _ = error "impossible: couldn't find myself in election"
     watchPid _ ZK.DeletedEvent ZK.ConnectedState _ =
-        proxy $ send spid (CheckCandidate name)
+        proxy $ nfSend spid (CheckCandidate name)
     watchPid _ _ _ _ = return ()
 
     stCandidate = st{candidates = Map.insert name (myid, staged) candidates}
@@ -545,7 +548,7 @@ getChildPids rzh node watcher = liftIO $
 
 watchCache :: State -> String -> a -> b -> ZK.State -> c -> IO ()
 watchCache State{..} node _ _ ZK.ConnectedState _ =
-    proxy $ send spid (ClearCache node)
+    proxy $ nfSend spid (ClearCache node)
 
 watchCache _ _ _ _ _ _ = return ()
 
@@ -574,7 +577,7 @@ watchRegistration Config{..} = do
 -- | Wait for zkController to startup and register iteself.
 -- This is only useful if you are *not* using a 'bootstrap'
 -- function to start your node, but rather starting the node yourself
--- and using one of the 'zkController' functions..
+-- and using one of the 'zkController' functions.
 waitController :: Int -> Process (Maybe ())
 waitController timeout =
  do res <- whereis controller
@@ -591,7 +594,7 @@ stopController =
  do res <- whereis controller
     case res of
         Nothing -> say "Could not find controller to stop it."
-        Just pid -> send pid Exit
+        Just pid -> nfSend pid Exit
 
 hoistEither :: Monad m => Either e a -> ExceptT e m a
 hoistEither = ExceptT . return
@@ -626,12 +629,22 @@ pidBytes = Just . BL.toStrict . encode
 controller :: String
 controller = "zookeeper:controller"
 
+-- We should not have any big surprises due to serialization semantics
+-- because all messaging will always be local in this module - it will never be necessary
+-- to actually serialize. Still, we do want to
+-- preserve expectations about which process is doing the evaluation.
+nfSendChan :: (Binary a, Typeable a, NFData a) => SendPort a -> a -> Process ()
+nfSendChan !port !msg = unsafeSendChan port (msg `deepseq` msg)
+
+nfSend :: (Binary a, Typeable a, NFData a) => ProcessId -> a -> Process ()
+nfSend !pid !msg = unsafeSend pid (msg `deepseq` msg)
+
 callZK :: Serializable a => (SendPort a -> Command) -> Process a
 callZK command =
     do Just pid <- whereis controller
-       (sendCh, replyCh) <- newChan
+       (nfSendCh, replyCh) <- newChan
        link pid
-       send pid (command sendCh)
+       nfSend pid (command nfSendCh)
        result <- receiveChan replyCh
        unlink pid
        return result
