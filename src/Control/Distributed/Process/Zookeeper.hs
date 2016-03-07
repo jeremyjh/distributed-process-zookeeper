@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE RecordWildCards    #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 
 -- | Provides service and node discovery for Cloud Haskell applications using
 --   a Zookeeper cluster for name registration, lookups and leader election.
@@ -49,8 +50,6 @@ import           Database.Zookeeper                       (AclList (..),
                                                            ZKError (..),
                                                            Zookeeper)
 import qualified Database.Zookeeper                       as ZK
-
-import           Control.Applicative                      ((<$>))
 import           Control.Concurrent                       (myThreadId,
                                                            newEmptyMVar,
                                                            putMVar, putMVar,
@@ -73,7 +72,12 @@ import           Data.List                                (isPrefixOf, sort)
 import           Data.Map.Strict                          (Map)
 import qualified Data.Map.Strict                          as Map
 import           Data.Maybe                               (fromMaybe)
+
+#if !MIN_VERSION_base(4,8,0)
 import           Data.Monoid                              (mempty)
+import           Control.Applicative                      ((<$>))
+#endif 
+
 import           Data.Typeable                            (Typeable)
 import           GHC.Generics                             (Generic)
 
@@ -662,7 +666,8 @@ spawnLinkedProxy =
     pid <- spawnLocal $
         let loop = join (liftIO $ takeMVar action)
                    >>= liftIO . putMVar result
-                   >> loop in link self >> loop
+                   >> loop
+        in link self >> loop
     link pid
     return (\f -> putMVar action f >> takeMVar result)
 
