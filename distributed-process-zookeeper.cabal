@@ -1,5 +1,5 @@
 name: distributed-process-zookeeper
-version: 0.2.1.0
+version: 0.2.2.0
 cabal-version: >=1.10
 build-type: Simple
 license: BSD3
@@ -40,7 +40,7 @@ flag zkexamples
  
 library
     build-depends:
-        base >=4.6 && < 4.9,
+        base >=4.6 && < 4.10,
         hzk >=2.1.0 && <2.2,
         distributed-process >=0.5.3 && <0.7,
         network-transport >=0.4.1.0 && <0.5,
