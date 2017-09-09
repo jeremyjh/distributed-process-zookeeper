@@ -20,3 +20,4 @@ tags
 tags (Case Conflict)
 TAGS
 .stack-work
+.dir-locals.el
